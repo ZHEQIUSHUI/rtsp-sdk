@@ -1,0 +1,93 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.sln.docstates
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Debug files
+*.pdb
+*.ilk
+*.exp
+
+# Test artifacts
+Testing/
+test-results/
+*.log
+soak_reports/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.#*
+
+# Package files
+*.tar.gz
+*.zip
+*.7z
+*.mp4
+
+test_videos
