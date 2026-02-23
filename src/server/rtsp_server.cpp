@@ -1048,6 +1048,8 @@ void RtspServer::stop() {
 }
 
 bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
+    const auto begin = std::chrono::steady_clock::now();
+    RTSP_LOG_INFO("RtspServer stop start, timeout_ms=" + std::to_string(timeout_ms));
     impl_->running_ = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     
@@ -1075,6 +1077,7 @@ bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
             }
             if (!joinThreadWithTimeout(c.thread, remain)) {
                 all_joined = false;
+                RTSP_LOG_ERROR("RtspServer stop timeout: connection thread still alive (blocking: RTSP connection loop)");
             }
         }
         impl_->connections_.clear();
@@ -1089,12 +1092,16 @@ bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
         }
         if (!joinThreadWithTimeout(impl_->cleanup_thread_, remain)) {
             all_joined = false;
+            RTSP_LOG_ERROR("RtspServer stop timeout: cleanup_thread still alive (blocking: cleanup loop sleep/wait)");
         }
     }
     
     // 清理所有路径
     std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
     impl_->paths_.clear();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - begin).count();
+    RTSP_LOG_INFO("RtspServer stop done, elapsed_ms=" + std::to_string(elapsed));
     return all_joined;
 }
 

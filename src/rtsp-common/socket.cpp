@@ -307,6 +307,15 @@ void Socket::close() {
     impl_->close();
 }
 
+bool Socket::shutdownReadWrite() {
+    if (impl_->fd_ < 0) return false;
+#ifdef _WIN32
+    return ::shutdown(impl_->fd_, SD_BOTH) == 0;
+#else
+    return ::shutdown(impl_->fd_, SHUT_RDWR) == 0;
+#endif
+}
+
 bool Socket::setNonBlocking(bool non_blocking) {
     if (impl_->fd_ < 0) return false;
 

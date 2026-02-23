@@ -42,6 +42,7 @@ public:
     ssize_t recv(uint8_t* buffer, size_t size, int timeout_ms = -1);
     
     void close();
+    bool shutdownReadWrite();
     bool setNonBlocking(bool non_blocking);
     bool setReuseAddr(bool reuse);
     bool setSendBufferSize(int size);

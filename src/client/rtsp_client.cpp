@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <iomanip>
 #include <future>
+#include <algorithm>
 
 namespace rtsp {
 
@@ -76,9 +77,7 @@ public:
     };
 
     RtpReceiver() = default;
-    ~RtpReceiver() {
-        stop();
-    }
+    ~RtpReceiver() { stop(); }
 
     bool init(uint16_t rtp_port, uint16_t rtcp_port) {
         if (!rtp_socket_.bindUdp("0.0.0.0", rtp_port)) {
@@ -100,11 +99,13 @@ public:
         receive_thread_ = std::thread([this]() { receiveLoop(); });
     }
 
-    void stop() {
+    bool stopWithTimeout(uint32_t timeout_ms) {
         if (!running_ && !receive_thread_.joinable()) {
-            return;
+            return true;
         }
         running_ = false;
+        rtp_socket_.shutdownReadWrite();
+        rtcp_socket_.shutdownReadWrite();
         if (rtp_port_ != 0) {
             // Wake a potentially blocking recvFrom on some platforms.
             Socket wake_socket;
@@ -113,11 +114,14 @@ public:
                 wake_socket.sendTo(&b, 1, "127.0.0.1", rtp_port_);
             }
         }
-        if (receive_thread_.joinable()) {
-            receive_thread_.join();
-        }
+        bool joined = joinThreadWithTimeout(receive_thread_, timeout_ms);
         rtp_socket_.close();
         rtcp_socket_.close();
+        return joined;
+    }
+
+    void stop() {
+        (void)stopWithTimeout(2000);
     }
 
     void setCallback(FrameCallback callback) {
@@ -468,6 +472,16 @@ private:
 // RtspClient::Impl 定义
 class RtspClient::Impl {
 public:
+    enum class ClientState {
+        Idle,
+        Opened,
+        Described,
+        Setup,
+        Playing,
+        Closing,
+        Closed
+    };
+
     RtspClientConfig config_;
     std::unique_ptr<Socket> control_socket_;
     std::unique_ptr<RtpReceiver> rtp_receiver_;
@@ -496,6 +510,7 @@ public:
     bool playing_ = false;
     bool receiver_started_ = false;
     std::atomic<bool> stop_waiting_{false};
+    std::atomic<ClientState> state_{ClientState::Idle};
     std::thread tcp_receive_thread_;
     std::atomic<bool> tcp_receive_running_{false};
     std::atomic<uint64_t> auth_retries_{0};
@@ -506,6 +521,22 @@ public:
     std::queue<VideoFrame> frame_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
+
+    bool isClosing() const {
+        return state_.load() == ClientState::Closing;
+    }
+
+    void setState(ClientState st) {
+        state_.store(st);
+    }
+
+    void wakeStopWaiters() {
+        stop_waiting_ = true;
+        queue_cv_.notify_all();
+        if (control_socket_) {
+            control_socket_->shutdownReadWrite();
+        }
+    }
 
     bool parseUrl(const std::string& url) {
         if (url.find("rtsp://") != 0) {
@@ -572,6 +603,10 @@ public:
 
     bool stopTcpReceiverThread(uint32_t timeout_ms) {
         tcp_receive_running_ = false;
+        if (control_socket_) {
+            control_socket_->shutdownReadWrite();
+        }
+        queue_cv_.notify_all();
         return joinThreadWithTimeout(tcp_receive_thread_, timeout_ms);
     }
 
@@ -726,7 +761,11 @@ public:
 
     bool sendRequest(const std::string& method, const std::string& uri,
                      const std::string& extra_headers, const std::string& body,
-                     std::string& response, bool allow_retry_401 = true) {
+                     std::string& response, bool allow_retry_401 = true,
+                     int recv_timeout_ms = 5000) {
+        if (isClosing()) {
+            return false;
+        }
         auto send_once = [&](bool with_auth) -> bool {
             std::ostringstream req;
             req << method << " " << uri << " RTSP/1.0\r\n";
@@ -744,9 +783,11 @@ public:
             if (!body.empty()) req << body;
 
             std::string req_str = req.str();
-            control_socket_->send((const uint8_t*)req_str.c_str(), req_str.size());
+            if (control_socket_->send((const uint8_t*)req_str.c_str(), req_str.size()) <= 0) {
+                return false;
+            }
             char buffer[8192];
-            ssize_t len = control_socket_->recv((uint8_t*)buffer, sizeof(buffer), 5000);
+            ssize_t len = control_socket_->recv((uint8_t*)buffer, sizeof(buffer), recv_timeout_ms);
             if (len <= 0) return false;
             response.assign(buffer, static_cast<size_t>(len));
             return true;
@@ -867,6 +908,10 @@ void RtspClient::setConfig(const RtspClientConfig& config) {
 }
 
 bool RtspClient::open(const std::string& url) {
+    auto st = impl_->state_.load();
+    if (!(st == Impl::ClientState::Idle || st == Impl::ClientState::Closed)) {
+        return false;
+    }
     if (!impl_->parseUrl(url)) {
         return false;
     }
@@ -878,10 +923,12 @@ bool RtspClient::open(const std::string& url) {
 
     impl_->connected_ = true;
     impl_->stop_waiting_ = false;
+    impl_->setState(Impl::ClientState::Opened);
     return true;
 }
 
 bool RtspClient::describe() {
+    if (impl_->isClosing()) return false;
     if (!impl_->connected_) return false;
     std::string response;
     if (!impl_->sendRequest("DESCRIBE", impl_->request_url_,
@@ -897,7 +944,11 @@ bool RtspClient::describe() {
     if (sdp_start == std::string::npos) return false;
     
     std::string sdp = response.substr(sdp_start + 4);
-    return impl_->parseSdp(sdp);
+    bool ok = impl_->parseSdp(sdp);
+    if (ok) {
+        impl_->setState(Impl::ClientState::Described);
+    }
+    return ok;
 }
 
 SessionInfo RtspClient::getSessionInfo() const {
@@ -913,6 +964,7 @@ void RtspClient::setErrorCallback(ErrorCallback callback) {
 }
 
 bool RtspClient::setup(int stream_index) {
+    if (impl_->isClosing()) return false;
     if (!impl_->connected_) return false;
     if (stream_index >= (int)impl_->session_info_.media_streams.size()) return false;
 
@@ -1001,10 +1053,12 @@ bool RtspClient::setup(int stream_index) {
         impl_->onFrame(frame);
     });
 
+    impl_->setState(Impl::ClientState::Setup);
     return true;
 }
 
 bool RtspClient::play(uint64_t start_time_ms) {
+    if (impl_->isClosing()) return false;
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
 
     std::ostringstream extra;
@@ -1024,6 +1078,7 @@ bool RtspClient::play(uint64_t start_time_ms) {
 
     impl_->playing_ = true;
     impl_->stop_waiting_ = false;
+    impl_->setState(Impl::ClientState::Playing);
     if (impl_->rtp_receiver_ && !impl_->receiver_started_) {
         if (impl_->use_tcp_transport_) {
             impl_->tcp_receive_running_ = true;
@@ -1040,10 +1095,13 @@ bool RtspClient::play(uint64_t start_time_ms) {
 }
 
 bool RtspClient::pause() {
+    if (impl_->isClosing()) return false;
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
 
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread(1000);
+        if (!impl_->stopTcpReceiverThread(1000)) {
+            RTSP_LOG_ERROR("pause timeout: tcp_receive_thread still alive");
+        }
         impl_->receiver_started_ = false;
     }
 
@@ -1053,20 +1111,26 @@ bool RtspClient::pause() {
     bool ok = impl_->sendRequest("PAUSE", impl_->request_url_, extra.str(), "", response);
     
     impl_->playing_ = false;
-    impl_->stop_waiting_ = true;
-    impl_->queue_cv_.notify_all();
+    impl_->wakeStopWaiters();
     if (!impl_->use_tcp_transport_ && impl_->rtp_receiver_ && impl_->receiver_started_) {
         impl_->rtp_receiver_->stop();
         impl_->receiver_started_ = false;
     }
-    return ok && response.find("200 OK") != std::string::npos;
+    if (ok && response.find("200 OK") != std::string::npos) {
+        impl_->setState(Impl::ClientState::Setup);
+        return true;
+    }
+    return false;
 }
 
 bool RtspClient::teardown() {
+    if (impl_->isClosing()) return false;
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
 
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread(1000);
+        if (!impl_->stopTcpReceiverThread(1000)) {
+            RTSP_LOG_ERROR("teardown timeout: tcp_receive_thread still alive");
+        }
         impl_->receiver_started_ = false;
     }
 
@@ -1076,22 +1140,21 @@ bool RtspClient::teardown() {
     impl_->sendRequest("TEARDOWN", impl_->request_url_, extra.str(), "", response, false);
 
     impl_->playing_ = false;
-    impl_->stop_waiting_ = true;
-    impl_->queue_cv_.notify_all();
+    impl_->wakeStopWaiters();
     impl_->session_id_.clear();
     
     if (impl_->rtp_receiver_) {
         impl_->rtp_receiver_->stop();
         impl_->receiver_started_ = false;
     }
-    
+    impl_->setState(Impl::ClientState::Opened);
     return true;
 }
 
 void RtspClient::receiveLoop() {
     std::unique_lock<std::mutex> lock(impl_->queue_mutex_);
     while (!impl_->stop_waiting_ && impl_->playing_) {
-        impl_->queue_cv_.wait_for(lock, std::chrono::milliseconds(200), [this] {
+        impl_->queue_cv_.wait(lock, [this] {
             return impl_->stop_waiting_ || !impl_->playing_ || !impl_->frame_queue_.empty();
         });
     }
@@ -1121,24 +1184,68 @@ bool RtspClient::isPlaying() const {
 }
 
 void RtspClient::close() {
-    closeWithTimeout(5000);
+    (void)closeWithTimeout(2000);
 }
 
 bool RtspClient::closeWithTimeout(uint32_t timeout_ms) {
-    teardown();
+    const auto begin = std::chrono::steady_clock::now();
+    RTSP_LOG_INFO("RtspClient close start, timeout_ms=" + std::to_string(timeout_ms));
+    impl_->setState(Impl::ClientState::Closing);
+    impl_->wakeStopWaiters();
+    RTSP_LOG_INFO("RtspClient close wake signal sent (cv notify + control socket shutdown)");
+    impl_->playing_ = false;
+
+    const auto deadline = begin + std::chrono::milliseconds(timeout_ms);
+    auto remain_ms = [&]() -> uint32_t {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    };
+
+    bool ok = true;
+    if (impl_->connected_ && !impl_->session_id_.empty()) {
+        std::ostringstream extra;
+        extra << "Session: " << impl_->session_id_ << "\r\n";
+        std::string response;
+        impl_->sendRequest("TEARDOWN", impl_->request_url_, extra.str(), "", response, false,
+                           static_cast<int>(std::min<uint32_t>(remain_ms(), 150)));
+    }
+
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread(timeout_ms);
+        auto t0 = std::chrono::steady_clock::now();
+        if (!impl_->stopTcpReceiverThread(remain_ms())) {
+            ok = false;
+            RTSP_LOG_ERROR("RtspClient close timeout: tcp_receive_thread still alive (blocking: control_socket recv)");
+        } else {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            RTSP_LOG_INFO("RtspClient close tcp_receive_thread exited, elapsed_ms=" + std::to_string(ms));
+        }
         impl_->receiver_started_ = false;
     }
-    
+
+    if (impl_->rtp_receiver_) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (!impl_->rtp_receiver_->stopWithTimeout(remain_ms())) {
+            ok = false;
+            RTSP_LOG_ERROR("RtspClient close timeout: rtp_receive_thread still alive (blocking: udp recvFrom)");
+        } else {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            RTSP_LOG_INFO("RtspClient close rtp_receive_thread exited, elapsed_ms=" + std::to_string(ms));
+        }
+    }
+
     if (impl_->control_socket_) {
+        impl_->control_socket_->shutdownReadWrite();
         impl_->control_socket_->close();
     }
-    
+
     impl_->connected_ = false;
     impl_->playing_ = false;
     impl_->receiver_started_ = false;
     impl_->stop_waiting_ = true;
+    impl_->session_id_.clear();
     {
         std::lock_guard<std::mutex> lock(impl_->queue_mutex_);
         while (!impl_->frame_queue_.empty()) {
@@ -1148,15 +1255,19 @@ bool RtspClient::closeWithTimeout(uint32_t timeout_ms) {
         }
     }
     impl_->queue_cv_.notify_all();
-    return true;
+    impl_->setState(Impl::ClientState::Closed);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - begin).count();
+    RTSP_LOG_INFO("RtspClient close done, elapsed_ms=" + std::to_string(elapsed));
+    return ok;
 }
 
 void RtspClient::interrupt() {
-    impl_->stop_waiting_ = true;
-    impl_->queue_cv_.notify_all();
+    impl_->wakeStopWaiters();
 }
 
 bool RtspClient::sendOptions() {
+    if (impl_->isClosing()) return false;
     if (!impl_->connected_) return false;
     std::string response;
     if (!impl_->sendRequest("OPTIONS", impl_->request_url_, "", "", response)) return false;
@@ -1164,10 +1275,13 @@ bool RtspClient::sendOptions() {
 }
 
 bool RtspClient::sendGetParameter(const std::string& param) {
+    if (impl_->isClosing()) return false;
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
     bool restart_tcp_receiver = false;
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread(1000);
+        if (!impl_->stopTcpReceiverThread(1000)) {
+            RTSP_LOG_ERROR("GET_PARAMETER timeout: tcp_receive_thread still alive");
+        }
         impl_->receiver_started_ = false;
         restart_tcp_receiver = impl_->playing_;
     }
@@ -1295,7 +1409,7 @@ bool SimpleRtspPlayer::readFrame(VideoFrame& frame) {
 }
 
 void SimpleRtspPlayer::close() {
-    closeWithTimeout(5000);
+    (void)closeWithTimeout(2000);
 }
 
 bool SimpleRtspPlayer::closeWithTimeout(uint32_t timeout_ms) {

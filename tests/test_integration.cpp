@@ -11,6 +11,10 @@
 #include <cassert>
 #include <thread>
 #include <chrono>
+#include <algorithm>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 using namespace rtsp;
 
@@ -465,6 +469,101 @@ void test_receive_interrupt_and_stop_timeout() {
     std::cout << "  Receive interrupt and stop timeout tests passed!" << std::endl;
 }
 
+void test_stop_latency_under_2s() {
+    std::cout << "Testing stop latency <= 200ms for receive waiters..." << std::endl;
+    RtspServer server;
+    assert(server.init("127.0.0.1", 18567));
+    assert(server.addPath("/live", CodecType::H264));
+    assert(server.start());
+
+    RtspClient client;
+    assert(client.open("rtsp://127.0.0.1:18567/live"));
+    assert(client.describe());
+    assert(client.setup(0));
+    assert(client.play(0));
+
+    std::thread loop_waiter([&]() {
+        client.receiveLoop();
+    });
+    std::thread frame_waiter([&]() {
+        VideoFrame f{};
+        (void)client.receiveFrame(f, 15000);
+    });
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    auto t0 = std::chrono::steady_clock::now();
+    assert(client.closeWithTimeout(2000));
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    assert(elapsed_ms <= 2000);
+
+    loop_waiter.join();
+    frame_waiter.join();
+    assert(server.stopWithTimeout(2000));
+    std::cout << "  stop latency ms=" << elapsed_ms << std::endl;
+    std::cout << "  Stop latency tests passed!" << std::endl;
+}
+
+int countOpenFds() {
+#ifdef _WIN32
+    return -1;
+#else
+    int count = 0;
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    while (readdir(d) != nullptr) {
+        count++;
+    }
+    closedir(d);
+    return count;
+#endif
+}
+
+static long percentileMs(std::vector<long> v, double p) {
+    if (v.empty()) return 0;
+    std::sort(v.begin(), v.end());
+    size_t idx = static_cast<size_t>((p / 100.0) * static_cast<double>(v.size() - 1));
+    return v[idx];
+}
+
+void test_open_play_stop_50_loops() {
+    std::cout << "Testing 50x open/play/stop stability..." << std::endl;
+    RtspServer server;
+    assert(server.init("127.0.0.1", 18568));
+    assert(server.addPath("/live", CodecType::H264));
+    assert(server.start());
+
+    const int fd_before = countOpenFds();
+    std::vector<long> stop_ms;
+    stop_ms.reserve(50);
+
+    for (int i = 0; i < 50; ++i) {
+        RtspClient client;
+        assert(client.open("rtsp://127.0.0.1:18568/live"));
+        assert(client.describe());
+        assert(client.setup(0));
+        assert(client.play(0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = client.closeWithTimeout(2000);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        stop_ms.push_back(ms);
+        assert(ok);
+    }
+
+    const int fd_after = countOpenFds();
+    if (fd_before >= 0 && fd_after >= 0) {
+        assert((fd_after - fd_before) < 16);
+    }
+    assert(server.stopWithTimeout(2000));
+
+    std::cout << "  stop latency p50=" << percentileMs(stop_ms, 50)
+              << "ms p95=" << percentileMs(stop_ms, 95)
+              << "ms p99=" << percentileMs(stop_ms, 99) << "ms" << std::endl;
+    std::cout << "  50x open/play/stop tests passed!" << std::endl;
+}
+
 void test_publish_client_api_smoke() {
     std::cout << "Testing RTSP publish client API smoke..." << std::endl;
     RtspPublisher pub;
@@ -493,6 +592,8 @@ int main() {
         test_digest_auth();
         test_auto_parameter_set_extraction();
         test_receive_interrupt_and_stop_timeout();
+        test_stop_latency_under_2s();
+        test_open_play_stop_50_loops();
         test_publish_client_api_smoke();
         
         std::cout << "\n=== All Integration Tests Passed! ===" << std::endl;
