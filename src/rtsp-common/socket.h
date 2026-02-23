@@ -4,6 +4,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <cstddef>
+
+#ifdef _WIN32
+    #include <BaseTsd.h>
+    typedef SSIZE_T ssize_t;
+#endif
 
 namespace rtsp {
 

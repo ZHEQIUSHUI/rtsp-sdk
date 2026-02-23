@@ -11,6 +11,16 @@
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
     typedef int socklen_t;
+    using pollfd = WSAPOLLFD;
+    #ifndef POLLIN
+        #define POLLIN POLLRDNORM
+    #endif
+    #ifndef POLLOUT
+        #define POLLOUT POLLWRNORM
+    #endif
+    static int poll(pollfd* fds, size_t nfds, int timeout_ms) {
+        return WSAPoll(fds, static_cast<ULONG>(nfds), timeout_ms);
+    }
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -185,7 +195,7 @@ bool Socket::connect(const std::string& ip, uint16_t port, int timeout_ms) {
         }
 
         // 等待连接完成
-        struct pollfd pfd;
+        pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLOUT;
         
@@ -282,7 +292,7 @@ ssize_t Socket::recv(uint8_t* buffer, size_t size, int timeout_ms) {
     if (impl_->fd_ < 0) return -1;
 
     if (timeout_ms >= 0) {
-        struct pollfd pfd;
+        pollfd pfd;
         pfd.fd = impl_->fd_;
         pfd.events = POLLIN;
         

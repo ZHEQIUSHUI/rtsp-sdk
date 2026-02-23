@@ -2,7 +2,6 @@
 #include <rtsp-common/common.h>
 #include <rtsp-common/socket.h>
 #include <cstring>
-#include <arpa/inet.h>
 
 namespace rtsp {
 

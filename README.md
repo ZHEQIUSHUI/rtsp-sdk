@@ -25,16 +25,19 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
 - **Observability**:
   - Structured logging (`plain` / `json`)
   - Server/client runtime stats API
-- **Cross-Platform**: Linux with standard socket APIs
+- **Cross-Platform**: Linux / Windows
 
 ## Requirements
 
 - C++14 compatible compiler
 - CMake 3.10 or higher
-- Linux operating system
-- pthread library
+- Linux or Windows
+- pthread library (Linux)
+- WinSock2 (Windows, system default)
 
 ## Build
+
+Linux:
 
 ```bash
 mkdir build && cd build
@@ -42,10 +45,25 @@ cmake ..
 make -j$(nproc)
 ```
 
+Windows (PowerShell):
+
+```powershell
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+
 ## Run Tests
+
+Linux:
 
 ```bash
 ctest --output-on-failure
+```
+
+Windows (PowerShell):
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 ## Soak Test
