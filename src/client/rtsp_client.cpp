@@ -563,9 +563,13 @@ public:
         state_.store(st);
     }
 
-    void wakeStopWaiters() {
+    void wakeFrameWaiters() {
         stop_waiting_ = true;
         queue_cv_.notify_all();
+    }
+
+    void wakeStopWaiters() {
+        wakeFrameWaiters();
         if (control_socket_) {
             control_socket_->shutdownReadWrite();
         }
@@ -634,9 +638,9 @@ public:
         }
     }
 
-    bool stopTcpReceiverThread(uint32_t timeout_ms) {
+    bool stopTcpReceiverThread(uint32_t timeout_ms, bool interrupt_control_socket) {
         tcp_receive_running_ = false;
-        if (control_socket_) {
+        if (interrupt_control_socket && control_socket_) {
             control_socket_->shutdownReadWrite();
         }
         queue_cv_.notify_all();
@@ -796,9 +800,6 @@ public:
                      const std::string& extra_headers, const std::string& body,
                      std::string& response, bool allow_retry_401 = true,
                      int recv_timeout_ms = 5000) {
-        if (isClosing()) {
-            return false;
-        }
         auto send_once = [&](bool with_auth) -> bool {
             std::ostringstream req;
             req << method << " " << uri << " RTSP/1.0\r\n";
@@ -1132,7 +1133,7 @@ bool RtspClient::pause() {
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
 
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        if (!impl_->stopTcpReceiverThread(1000)) {
+        if (!impl_->stopTcpReceiverThread(1000, false)) {
             RTSP_LOG_ERROR("pause timeout: tcp_receive_thread still alive");
         }
         impl_->receiver_started_ = false;
@@ -1144,7 +1145,7 @@ bool RtspClient::pause() {
     bool ok = impl_->sendRequest("PAUSE", impl_->request_url_, extra.str(), "", response);
     
     impl_->playing_ = false;
-    impl_->wakeStopWaiters();
+    impl_->wakeFrameWaiters();
     if (!impl_->use_tcp_transport_ && impl_->rtp_receiver_ && impl_->receiver_started_) {
         impl_->rtp_receiver_->stop();
         impl_->receiver_started_ = false;
@@ -1161,7 +1162,7 @@ bool RtspClient::teardown() {
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
 
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        if (!impl_->stopTcpReceiverThread(1000)) {
+        if (!impl_->stopTcpReceiverThread(1000, false)) {
             RTSP_LOG_ERROR("teardown timeout: tcp_receive_thread still alive");
         }
         impl_->receiver_started_ = false;
@@ -1173,7 +1174,7 @@ bool RtspClient::teardown() {
     impl_->sendRequest("TEARDOWN", impl_->request_url_, extra.str(), "", response, false);
 
     impl_->playing_ = false;
-    impl_->wakeStopWaiters();
+    impl_->wakeFrameWaiters();
     impl_->session_id_.clear();
     
     if (impl_->rtp_receiver_) {
@@ -1224,8 +1225,8 @@ bool RtspClient::closeWithTimeout(uint32_t timeout_ms) {
     const auto begin = std::chrono::steady_clock::now();
     RTSP_LOG_INFO("RtspClient close start, timeout_ms=" + std::to_string(timeout_ms));
     impl_->setState(Impl::ClientState::Closing);
-    impl_->wakeStopWaiters();
-    RTSP_LOG_INFO("RtspClient close wake signal sent (cv notify + control socket shutdown)");
+    impl_->wakeFrameWaiters();
+    RTSP_LOG_INFO("RtspClient close wake signal sent (cv notify)");
     impl_->playing_ = false;
 
     const auto deadline = begin + std::chrono::milliseconds(timeout_ms);
@@ -1246,7 +1247,7 @@ bool RtspClient::closeWithTimeout(uint32_t timeout_ms) {
 
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
         auto t0 = std::chrono::steady_clock::now();
-        if (!impl_->stopTcpReceiverThread(remain_ms())) {
+        if (!impl_->stopTcpReceiverThread(remain_ms(), true)) {
             ok = false;
             RTSP_LOG_ERROR("RtspClient close timeout: tcp_receive_thread still alive (blocking: control_socket recv)");
         } else {
@@ -1312,7 +1313,7 @@ bool RtspClient::sendGetParameter(const std::string& param) {
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
     bool restart_tcp_receiver = false;
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        if (!impl_->stopTcpReceiverThread(1000)) {
+        if (!impl_->stopTcpReceiverThread(1000, false)) {
             RTSP_LOG_ERROR("GET_PARAMETER timeout: tcp_receive_thread still alive");
         }
         impl_->receiver_started_ = false;
