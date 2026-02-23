@@ -22,6 +22,96 @@
 
 namespace rtsp {
 
+namespace {
+
+inline bool hasStartCode3(const uint8_t* data, size_t size, size_t i) {
+    return i + 3 <= size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01;
+}
+
+inline bool hasStartCode4(const uint8_t* data, size_t size, size_t i) {
+    return i + 4 <= size && data[i] == 0x00 && data[i + 1] == 0x00 &&
+           data[i + 2] == 0x00 && data[i + 3] == 0x01;
+}
+
+template <typename Fn>
+void forEachAnnexBNalu(const uint8_t* data, size_t size, Fn&& fn) {
+    if (!data || size == 0) {
+        return;
+    }
+
+    std::vector<size_t> starts;
+    starts.reserve(16);
+    for (size_t i = 0; i + 3 < size; ++i) {
+        if (hasStartCode4(data, size, i)) {
+            starts.push_back(i + 4);
+            i += 3;
+        } else if (hasStartCode3(data, size, i)) {
+            starts.push_back(i + 3);
+            i += 2;
+        }
+    }
+
+    if (starts.empty()) {
+        fn(data, size);
+        return;
+    }
+
+    for (size_t idx = 0; idx < starts.size(); ++idx) {
+        const size_t nalu_start = starts[idx];
+        size_t nalu_end = (idx + 1 < starts.size()) ? starts[idx + 1] : size;
+        if (nalu_end > nalu_start) {
+            fn(data + nalu_start, nalu_end - nalu_start);
+        }
+    }
+}
+
+bool assignIfChanged(std::vector<uint8_t>& dst, const uint8_t* src, size_t src_size) {
+    if (!src || src_size == 0) {
+        return false;
+    }
+    if (dst.size() == src_size && std::memcmp(dst.data(), src, src_size) == 0) {
+        return false;
+    }
+    dst.assign(src, src + src_size);
+    return true;
+}
+
+bool autoExtractH264ParameterSets(PathConfig& config, const uint8_t* data, size_t size) {
+    bool updated = false;
+    forEachAnnexBNalu(data, size, [&](const uint8_t* nalu, size_t nalu_size) {
+        if (nalu_size == 0) {
+            return;
+        }
+        const uint8_t type = nalu[0] & 0x1F;
+        if (type == 7) {
+            updated = assignIfChanged(config.sps, nalu, nalu_size) || updated;
+        } else if (type == 8) {
+            updated = assignIfChanged(config.pps, nalu, nalu_size) || updated;
+        }
+    });
+    return updated;
+}
+
+bool autoExtractH265ParameterSets(PathConfig& config, const uint8_t* data, size_t size) {
+    bool updated = false;
+    forEachAnnexBNalu(data, size, [&](const uint8_t* nalu, size_t nalu_size) {
+        if (nalu_size < 2) {
+            return;
+        }
+        const uint8_t type = (nalu[0] >> 1) & 0x3F;
+        if (type == 32) {
+            updated = assignIfChanged(config.vps, nalu, nalu_size) || updated;
+        } else if (type == 33) {
+            updated = assignIfChanged(config.sps, nalu, nalu_size) || updated;
+        } else if (type == 34) {
+            updated = assignIfChanged(config.pps, nalu, nalu_size) || updated;
+        }
+    });
+    return updated;
+}
+
+} // namespace
+
 // 从完整RTSP URL中提取路径部分
 // 支持格式: rtsp://host:port/path 或 /path
 static std::string extractPathFromUrl(const std::string& url) {
@@ -1009,7 +1099,15 @@ bool RtspServer::pushH264Data(const std::string& path, const uint8_t* data, size
     if (it == impl_->paths_.end()) {
         return false;
     }
-    
+
+    bool updated = false;
+    if (is_key || it->second->config.sps.empty() || it->second->config.pps.empty()) {
+        updated = autoExtractH264ParameterSets(it->second->config, data, size);
+    }
+    if (updated) {
+        RTSP_LOG_INFO("Auto-updated H264 parameter sets for path: " + path);
+    }
+
     it->second->broadcastFrame(frame);
     impl_->stats_.frames_pushed++;
     return true;
@@ -1030,7 +1128,15 @@ bool RtspServer::pushH265Data(const std::string& path, const uint8_t* data, size
     if (it == impl_->paths_.end()) {
         return false;
     }
-    
+
+    bool updated = false;
+    if (is_key || it->second->config.vps.empty() || it->second->config.sps.empty() || it->second->config.pps.empty()) {
+        updated = autoExtractH265ParameterSets(it->second->config, data, size);
+    }
+    if (updated) {
+        RTSP_LOG_INFO("Auto-updated H265 parameter sets for path: " + path);
+    }
+
     it->second->broadcastFrame(frame);
     impl_->stats_.frames_pushed++;
     return true;

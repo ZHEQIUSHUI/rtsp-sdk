@@ -9,6 +9,7 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
   - H.264 (RFC 6184) and H.265/HEVC (RFC 7798) RTP payload formats
   - UDP (RTP/AVP) + TCP interleaved transport
   - Basic/Digest authentication
+  - Auto-extract H.264 SPS/PPS and H.265 VPS/SPS/PPS from keyframes (no mandatory manual fill)
   - Automatic SDP generation with sprop-parameter-sets
 
 - **RTSP Client**: Both low-level and high-level APIs
@@ -71,32 +72,33 @@ The script writes `server.log`, `client.log`, and markdown report under `soak_re
 using namespace rtsp;
 
 int main() {
-    // Create server
-    RtspServer server("0.0.0.0", 8554);
-    
-    // Create a media path
-    MediaConfig config;
+    RtspServer server;
+    server.init("0.0.0.0", 8554);
+
+    // Add media path
+    PathConfig config;
+    config.path = "/live/stream";
     config.codec = CodecType::H264;
     config.width = 1920;
     config.height = 1080;
     config.fps = 30;
-    config.sps = {0x67, 0x42, 0x00, 0x28, ...};  // SPS NALU
-    config.pps = {0x68, 0xCE, 0x3C, 0x80, ...};  // PPS NALU
-    
-    server.createPath("/live/stream", config);
-    
-    // Start server
+    // Optional: manually set SPS/PPS.
+    // If omitted, server auto-extracts from pushed keyframes.
+    // config.sps = {...};
+    // config.pps = {...};
+    server.addPath(config);
+
     server.start();
-    
-    // Push video frames (from encoder thread)
+
+    // Push Annex-B H264 frame data (with start codes)
     while (running) {
-        uint8_t* h264_data = ...;  // From video encoder
-        size_t data_size = ...;
-        int64_t pts = ...;         // Presentation timestamp in ms
-        
-        server.pushH264Data("/live/stream", h264_data, data_size, pts);
+        const uint8_t* h264_data = ...;
+        size_t data_size = ...;     // includes SPS/PPS/IDR for keyframe
+        uint64_t pts_ms = ...;
+        bool is_key = ...;
+        server.pushH264Data("/live/stream", h264_data, data_size, pts_ms, is_key);
     }
-    
+
     server.stop();
     return 0;
 }
@@ -139,17 +141,20 @@ int main() {
 
 ### Server API
 
-- `RtspServer(const std::string& ip, int port)` - Create server
-- `bool createPath(const std::string& path, const MediaConfig& config)` - Create media endpoint
+- `bool init(const std::string& host, uint16_t port)` - Initialize server
+- `bool addPath(const PathConfig& config)` - Add media path
 - `bool start()` / `void stop()` - Control server
-- `void pushH264Data(path, data, size, pts)` - Push H.264 frame
-- `void pushH265Data(path, data, size, pts)` - Push H.265 frame
+- `bool pushH264Data(path, data, size, pts, is_key)` - Push H.264 Annex-B frame
+- `bool pushH265Data(path, data, size, pts, is_key)` - Push H.265 Annex-B frame
+- `void setAuth(user, pass)` / `setAuthDigest(user, pass)` - Enable auth
+- `RtspServerStats getStats()` - Runtime metrics
 
 ### Client API
 
-- `SimpleRtspPlayer::open(url)` - Connect to stream
-- `SimpleRtspPlayer::play()` / `stop()` - Control playback
-- `SimpleRtspPlayer::setFrameCallback(cb)` - Set frame receiver
+- `bool open(url)` / `void close()` - Connect/disconnect
+- `bool describe()` / `bool setup()` / `bool play()` - RTSP control flow
+- `bool receiveFrame(frame, timeout_ms)` - Blocking receive
+- `RtspClientStats getStats()` - Runtime metrics
 
 ## Project Structure
 

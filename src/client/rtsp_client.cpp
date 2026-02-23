@@ -625,6 +625,30 @@ public:
                     current_media->fps = static_cast<uint32_t>(std::stod(match[1]));
                 }
             }
+            else if (line.find("a=fmtp:") == 0 && current_media) {
+                std::smatch match;
+                std::regex h264_sprop("sprop-parameter-sets=([^;\\s]+)");
+                if (std::regex_search(line, match, h264_sprop)) {
+                    std::string sprops = match[1].str();
+                    size_t comma = sprops.find(',');
+                    if (comma != std::string::npos) {
+                        current_media->sps = base64Decode(sprops.substr(0, comma));
+                        current_media->pps = base64Decode(sprops.substr(comma + 1));
+                    }
+                }
+                std::regex h265_vps("sprop-vps=([^;\\s]+)");
+                if (std::regex_search(line, match, h265_vps)) {
+                    current_media->vps = base64Decode(match[1].str());
+                }
+                std::regex h265_sps("sprop-sps=([^;\\s]+)");
+                if (std::regex_search(line, match, h265_sps)) {
+                    current_media->sps = base64Decode(match[1].str());
+                }
+                std::regex h265_pps("sprop-pps=([^;\\s]+)");
+                if (std::regex_search(line, match, h265_pps)) {
+                    current_media->pps = base64Decode(match[1].str());
+                }
+            }
         }
         
         return true;

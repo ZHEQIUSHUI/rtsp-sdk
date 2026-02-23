@@ -360,6 +360,60 @@ void test_digest_auth() {
     std::cout << "  Digest auth tests passed!" << std::endl;
 }
 
+void test_auto_parameter_set_extraction() {
+    std::cout << "Testing auto parameter-set extraction..." << std::endl;
+
+    RtspServer server;
+    assert(server.init("127.0.0.1", 18564));
+    assert(server.addPath("/h264", CodecType::H264));
+    assert(server.addPath("/h265", CodecType::H265));
+    assert(server.start());
+
+    std::vector<uint8_t> h264_key = {
+        0x00, 0x00, 0x00, 0x01,
+        0x67, 0x42, 0x00, 0x28,
+        0x00, 0x00, 0x00, 0x01,
+        0x68, 0xCE, 0x3C, 0x80,
+        0x00, 0x00, 0x00, 0x01,
+        0x65, 0x88, 0x84, 0x21
+    };
+    assert(server.pushH264Data("/h264", h264_key.data(), h264_key.size(), 0, true));
+
+    std::vector<uint8_t> h265_key = {
+        0x00, 0x00, 0x00, 0x01,
+        0x40, 0x01, 0x0C, 0x01, 0xFF, // VPS
+        0x00, 0x00, 0x00, 0x01,
+        0x42, 0x01, 0x01, 0x01,       // SPS
+        0x00, 0x00, 0x00, 0x01,
+        0x44, 0x01, 0xC0, 0xF1,       // PPS
+        0x00, 0x00, 0x00, 0x01,
+        0x26, 0x01, 0xAF, 0x09        // IDR
+    };
+    assert(server.pushH265Data("/h265", h265_key.data(), h265_key.size(), 0, true));
+
+    RtspClient h264_client;
+    assert(h264_client.open("rtsp://127.0.0.1:18564/h264"));
+    assert(h264_client.describe());
+    auto h264_info = h264_client.getSessionInfo();
+    assert(!h264_info.media_streams.empty());
+    assert(!h264_info.media_streams[0].sps.empty());
+    assert(!h264_info.media_streams[0].pps.empty());
+    h264_client.close();
+
+    RtspClient h265_client;
+    assert(h265_client.open("rtsp://127.0.0.1:18564/h265"));
+    assert(h265_client.describe());
+    auto h265_info = h265_client.getSessionInfo();
+    assert(!h265_info.media_streams.empty());
+    assert(!h265_info.media_streams[0].vps.empty());
+    assert(!h265_info.media_streams[0].sps.empty());
+    assert(!h265_info.media_streams[0].pps.empty());
+    h265_client.close();
+
+    server.stop();
+    std::cout << "  Auto parameter-set extraction tests passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Integration Tests ===" << std::endl;
     
@@ -374,6 +428,7 @@ int main() {
         test_basic_auth();
         test_tcp_interleaved_streaming();
         test_digest_auth();
+        test_auto_parameter_set_extraction();
         
         std::cout << "\n=== All Integration Tests Passed! ===" << std::endl;
         return 0;
