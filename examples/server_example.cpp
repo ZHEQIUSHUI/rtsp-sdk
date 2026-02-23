@@ -111,7 +111,8 @@ int main(int argc, char* argv[]) {
     config.height = 480;
     config.fps = 30;
     
-    // 设置 SPS/PPS (必需的，用于 SDP 中的 sprop-parameter-sets)
+    // 可选：手动设置 SPS/PPS。
+    // 如不设置，服务端会在 pushH264Data 的关键帧中自动提取并填充到 SDP。
     config.sps.assign(EXAMPLE_SPS, EXAMPLE_SPS + sizeof(EXAMPLE_SPS));
     config.pps.assign(EXAMPLE_PPS, EXAMPLE_PPS + sizeof(EXAMPLE_PPS));
 
