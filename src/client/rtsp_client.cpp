@@ -149,9 +149,22 @@ public:
         return s;
     }
 
+    static uint32_t parseRtpTimestampFromRaw(const uint8_t* data, size_t len) {
+        if (!data || len < 8) return 0;
+        return (static_cast<uint32_t>(data[4]) << 24) |
+               (static_cast<uint32_t>(data[5]) << 16) |
+               (static_cast<uint32_t>(data[6]) << 8) |
+               static_cast<uint32_t>(data[7]);
+    }
+
+    static uint32_t parseRtpTimestampFromPacket(const std::vector<uint8_t>& packet) {
+        return parseRtpTimestampFromRaw(packet.data(), packet.size());
+    }
+
     void ingestRtpPacket(const uint8_t* data, size_t len) {
         if (!data || len < 12) return;
         uint16_t seq = static_cast<uint16_t>((data[2] << 8) | data[3]);
+        uint32_t ts = parseRtpTimestampFromRaw(data, len);
         packets_received_++;
 
         if (!reorder_initialized_) {
@@ -181,6 +194,26 @@ public:
                 processRtpPacket(run->second.data(), run->second.size());
                 reorder_buffer_.erase(run);
                 expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+            }
+        }
+
+        // If we're stuck waiting for a missing sequence and packets from a newer RTP timestamp
+        // have already arrived, force-advance to avoid indefinite head-of-line blocking.
+        if (!reorder_buffer_.empty() && reorder_buffer_.find(expected_seq_) == reorder_buffer_.end()) {
+            auto first_it = reorder_buffer_.begin();
+            uint32_t first_ts = parseRtpTimestampFromPacket(first_it->second);
+            if (ts != first_ts) {
+                if (expected_seq_ != first_it->first) {
+                    packet_loss_events_++;
+                }
+                expected_seq_ = first_it->first;
+                while (true) {
+                    auto run = reorder_buffer_.find(expected_seq_);
+                    if (run == reorder_buffer_.end()) break;
+                    processRtpPacket(run->second.data(), run->second.size());
+                    reorder_buffer_.erase(run);
+                    expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+                }
             }
         }
     }

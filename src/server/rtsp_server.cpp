@@ -946,10 +946,19 @@ public:
     std::vector<ConnectionHandle> connections_;
     
     std::thread cleanup_thread_;
+    std::mutex cleanup_mutex_;
+    std::condition_variable cleanup_cv_;
     
     void cleanupLoop() {
-        while (running_) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        while (true) {
+            std::unique_lock<std::mutex> wait_lock(cleanup_mutex_);
+            cleanup_cv_.wait_for(wait_lock, std::chrono::seconds(5), [this]() {
+                return !running_.load();
+            });
+            if (!running_) {
+                break;
+            }
+            wait_lock.unlock();
             
             // 清理超时会话
             std::vector<std::pair<std::string, std::string>> disconnects;
@@ -1051,6 +1060,7 @@ bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
     const auto begin = std::chrono::steady_clock::now();
     RTSP_LOG_INFO("RtspServer stop start, timeout_ms=" + std::to_string(timeout_ms));
     impl_->running_ = false;
+    impl_->cleanup_cv_.notify_all();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     
     if (impl_->tcp_server_) {
