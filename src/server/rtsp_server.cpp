@@ -110,6 +110,22 @@ bool autoExtractH265ParameterSets(PathConfig& config, const uint8_t* data, size_
     return updated;
 }
 
+std::shared_ptr<std::vector<uint8_t>> makeManagedBuffer(const uint8_t* data, size_t size) {
+    auto buf = std::make_shared<std::vector<uint8_t>>();
+    if (data && size > 0) {
+        buf->assign(data, data + size);
+    }
+    return buf;
+}
+
+VideoFrame cloneFrameManaged(const VideoFrame& src) {
+    VideoFrame copy = src;
+    copy.managed_data = makeManagedBuffer(src.data, src.size);
+    copy.data = copy.managed_data->empty() ? nullptr : copy.managed_data->data();
+    copy.size = copy.managed_data->size();
+    return copy;
+}
+
 } // namespace
 
 // 从完整RTSP URL中提取路径部分
@@ -249,7 +265,7 @@ struct ClientSession {
         std::lock_guard<std::mutex> lock(queue_mutex);
         while (!frame_queue.empty()) {
             auto& frame = frame_queue.front();
-            delete[] frame.data;
+            freeVideoFrame(frame);
             frame_queue.pop();
         }
     }
@@ -259,14 +275,12 @@ struct ClientSession {
         if (frame_queue.size() >= MAX_QUEUE_SIZE) {
             // 队列满，丢弃最旧的帧
             auto& old = frame_queue.front();
-            delete[] old.data;
+            freeVideoFrame(old);
             frame_queue.pop();
         }
         
         // 复制帧
-        VideoFrame copy = frame;
-        copy.data = new uint8_t[frame.size];
-        memcpy(copy.data, frame.data, frame.size);
+        VideoFrame copy = cloneFrameManaged(frame);
         
         frame_queue.push(copy);
         queue_cv.notify_one();
@@ -328,7 +342,7 @@ struct ClientSession {
                 }
             }
             
-            delete[] frame.data;
+            freeVideoFrame(frame);
         }
     }
 };
@@ -350,12 +364,8 @@ struct MediaPath {
         // 更新最新帧
         {
             std::lock_guard<std::mutex> lock(latest_frame_mutex);
-            if (latest_frame.data) {
-                delete[] latest_frame.data;
-            }
-            latest_frame = frame;
-            latest_frame.data = new uint8_t[frame.size];
-            memcpy(latest_frame.data, frame.data, frame.size);
+            freeVideoFrame(latest_frame);
+            latest_frame = cloneFrameManaged(frame);
             has_latest_frame = true;
         }
         
@@ -397,9 +407,7 @@ struct MediaPath {
         }
         sessions.clear();
         
-        if (latest_frame.data) {
-            delete[] latest_frame.data;
-        }
+        freeVideoFrame(latest_frame);
     }
 };
 
@@ -1213,8 +1221,9 @@ VideoFrame createVideoFrame(CodecType codec, const uint8_t* data, size_t size,
     VideoFrame frame = {};
     frame.codec = codec;
     frame.type = FrameType::P;
-    frame.data = const_cast<uint8_t*>(data);
-    frame.size = size;
+    frame.managed_data = makeManagedBuffer(data, size);
+    frame.data = frame.managed_data->empty() ? nullptr : frame.managed_data->data();
+    frame.size = frame.managed_data->size();
     frame.pts = pts;
     frame.dts = pts;
     frame.width = width;
@@ -1224,7 +1233,10 @@ VideoFrame createVideoFrame(CodecType codec, const uint8_t* data, size_t size,
 }
 
 void freeVideoFrame(VideoFrame& frame) {
-    delete[] frame.data;
+    if (!frame.managed_data && frame.data) {
+        delete[] frame.data;
+    }
+    frame.managed_data.reset();
     frame.data = nullptr;
     frame.size = 0;
 }

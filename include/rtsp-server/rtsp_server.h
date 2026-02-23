@@ -110,11 +110,11 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// 工具函数：创建视频帧
+// 工具函数：创建视频帧（内部会复制数据并使用智能托管）
 VideoFrame createVideoFrame(CodecType codec, const uint8_t* data, size_t size,
                             uint64_t pts, uint32_t width, uint32_t height, uint32_t fps);
 
-// 工具函数：释放视频帧内存
+// 工具函数：显式释放视频帧内存（可选）
 void freeVideoFrame(VideoFrame& frame);
 
 } // namespace rtsp

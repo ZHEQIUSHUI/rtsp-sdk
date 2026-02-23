@@ -15,6 +15,7 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
 - **RTSP Client**: Both low-level and high-level APIs
   - `RtspClient`: Low-level client for custom control flow
   - `SimpleRtspPlayer`: High-level player with callback-based frame receiving
+  - `VideoFrame` payload uses smart-managed memory (no manual `delete[]`)
   - Automatic RTP packet reception, reordering and decoding
   - URL auth parsing (`rtsp://user:pass@host/path`)
   - UDP/TCP setup fallback

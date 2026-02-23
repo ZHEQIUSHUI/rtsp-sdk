@@ -354,7 +354,6 @@ void test_h264_stap_a_receive() {
     assert(frame.type == FrameType::IDR);
     assert(frame.size >= 8);
     assert(frame.data[0] == 0x00 && frame.data[1] == 0x00 && frame.data[2] == 0x00 && frame.data[3] == 0x01);
-    delete[] frame.data;
 
     client.close();
     server.stop();
@@ -381,7 +380,6 @@ void test_h265_ap_receive() {
     assert(frame.type == FrameType::IDR);
     assert(frame.size >= 8);
     assert(frame.data[0] == 0x00 && frame.data[1] == 0x00 && frame.data[2] == 0x00 && frame.data[3] == 0x01);
-    delete[] frame.data;
 
     client.close();
     server.stop();
@@ -408,7 +406,6 @@ void test_h264_stap_b_receive() {
     assert(frame.type == FrameType::IDR);
     assert(frame.size >= 8);
     assert(frame.data[0] == 0x00 && frame.data[1] == 0x00 && frame.data[2] == 0x00 && frame.data[3] == 0x01);
-    delete[] frame.data;
 
     client.close();
     server.stop();
@@ -437,7 +434,6 @@ void test_h265_fu_loss_resync() {
     assert(frame.data[0] == 0x00 && frame.data[1] == 0x00 && frame.data[2] == 0x00 && frame.data[3] == 0x01);
     // Reconstructed NAL header should be 0x26 0x01 for type=19 stream.
     assert(frame.data[4] == 0x26 && frame.data[5] == 0x01);
-    delete[] frame.data;
 
     client.close();
     server.stop();
@@ -468,7 +464,6 @@ void test_h265_fu_out_of_order_reorder() {
     assert(frame.size >= 12);
     assert(frame.data[0] == 0x00 && frame.data[1] == 0x00 && frame.data[2] == 0x00 && frame.data[3] == 0x01);
     assert(frame.data[4] == 0x26 && frame.data[5] == 0x01);
-    delete[] frame.data;
 
     client.close();
     server.stop();

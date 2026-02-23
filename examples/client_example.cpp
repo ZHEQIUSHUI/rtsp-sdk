@@ -149,8 +149,7 @@ int main(int argc, char* argv[]) {
         }
         VideoFrame frame;
         if (client.receiveFrame(frame, 1000)) {
-            // 处理帧（这里只是打印信息，实际应用可以解码显示）
-            delete[] frame.data;
+            // 处理帧（智能托管，无需手动释放）
         }
     }
 

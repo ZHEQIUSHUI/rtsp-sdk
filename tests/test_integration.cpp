@@ -307,7 +307,6 @@ void test_tcp_interleaved_streaming() {
     assert(client.receiveFrame(frame, 2000));
     assert(frame.codec == CodecType::H264);
     assert(frame.size > 4);
-    delete[] frame.data;
 
     auto cs = client.getStats();
     assert(cs.using_tcp_transport);

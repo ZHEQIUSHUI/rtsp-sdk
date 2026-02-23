@@ -35,6 +35,9 @@ struct VideoFrame {
     CodecType codec;        // 编码类型
     FrameType type;         // 帧类型
     uint8_t* data;          // 帧数据
+    // 智能托管的数据持有者。若非空，data 指向 managed_data->data()，
+    // 用户无需手动 delete[]。
+    std::shared_ptr<std::vector<uint8_t>> managed_data;
     size_t size;            // 数据大小
     uint64_t pts;           // 显示时间戳 (毫秒)
     uint64_t dts;           // 解码时间戳 (毫秒)

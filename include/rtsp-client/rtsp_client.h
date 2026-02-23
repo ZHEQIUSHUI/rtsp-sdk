@@ -133,7 +133,6 @@ using ErrorCallback = std::function<void(const std::string& error)>;
  *     VideoFrame frame;
  *     while (client.receiveFrame(frame, 1000)) {
  *         // 处理帧
- *         delete[] frame.data;
  *     }
  * }
  * @endcode
@@ -221,7 +220,7 @@ public:
      * 内部有队列缓存，队列大小由 RtspClientConfig::buffer_size 控制。
      * 队列满时会丢弃最旧的帧。
      * 
-     * @param frame 输出帧数据（需调用者 delete[] frame.data）
+     * @param frame 输出帧数据（智能托管，无需手动释放）
      * @param timeout_ms 超时时间（毫秒）
      * @return true 成功获取一帧，false 超时或出错
      */
@@ -293,7 +292,6 @@ private:
  *     VideoFrame frame;
  *     while (player.readFrame(frame)) {
  *         // 处理帧
- *         delete[] frame.data;
  *     }
  * }
  * player.close();
@@ -336,7 +334,7 @@ public:
      * 如果没有设置回调，可以使用此方法阻塞读取帧。
      * 内部有队列缓存，队列满时会丢弃最旧的帧。
      * 
-     * @param frame 输出帧数据（需调用者 delete[] frame.data）
+     * @param frame 输出帧数据（智能托管，无需手动释放）
      * @return true 成功，false 结束或出错
      */
     bool readFrame(VideoFrame& frame);

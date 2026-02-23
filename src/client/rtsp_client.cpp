@@ -14,6 +14,32 @@
 
 namespace rtsp {
 
+namespace {
+
+std::shared_ptr<std::vector<uint8_t>> makeManagedBuffer(const uint8_t* data, size_t size) {
+    auto buf = std::make_shared<std::vector<uint8_t>>();
+    if (data && size > 0) {
+        buf->assign(data, data + size);
+    }
+    return buf;
+}
+
+VideoFrame cloneFrameManaged(const VideoFrame& src) {
+    VideoFrame copy = src;
+    copy.managed_data = makeManagedBuffer(src.data, src.size);
+    copy.data = copy.managed_data->empty() ? nullptr : copy.managed_data->data();
+    copy.size = copy.managed_data->size();
+    return copy;
+}
+
+void releaseFrameData(VideoFrame& frame) {
+    frame.managed_data.reset();
+    frame.data = nullptr;
+    frame.size = 0;
+}
+
+} // namespace
+
 // RTP接收器实现（简化版）
 class RtpReceiver {
 public:
@@ -162,16 +188,14 @@ private:
         frame.height = height_;
         frame.fps = fps_;
         frame.type = frame_is_idr_ ? FrameType::IDR : FrameType::P;
-        frame.size = frame_buffer_.size();
-        frame.data = new uint8_t[frame.size];
-        memcpy(frame.data, frame_buffer_.data(), frame.size);
+        frame.managed_data = makeManagedBuffer(frame_buffer_.data(), frame_buffer_.size());
+        frame.data = frame.managed_data->empty() ? nullptr : frame.managed_data->data();
+        frame.size = frame.managed_data->size();
 
         if (callback_) {
             callback_(frame);
         }
         frames_output_++;
-
-        delete[] frame.data;
         frame_buffer_.clear();
         frame_is_idr_ = false;
         frame_in_progress_ = false;
@@ -769,13 +793,12 @@ public:
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             if (frame_queue_.size() >= config_.buffer_size) {
-                delete[] frame_queue_.front().data;
+                auto& old = frame_queue_.front();
+                releaseFrameData(old);
                 frame_queue_.pop();
             }
             
-            VideoFrame copy = frame;
-            copy.data = new uint8_t[frame.size];
-            memcpy(copy.data, frame.data, frame.size);
+            VideoFrame copy = cloneFrameManaged(frame);
             frame_queue_.push(copy);
         }
         queue_cv_.notify_one();
@@ -1158,9 +1181,7 @@ bool SimpleRtspPlayer::open(const std::string& url) {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             if (frame_buffer_.size() < MAX_BUFFER_SIZE) {
-                VideoFrame copy = frame;
-                copy.data = new uint8_t[frame.size];
-                memcpy(copy.data, frame.data, frame.size);
+                VideoFrame copy = cloneFrameManaged(frame);
                 frame_buffer_.push_back(copy);
             }
             buffer_cv_.notify_one();
@@ -1211,7 +1232,7 @@ void SimpleRtspPlayer::close() {
     }
     
     for (auto& f : frame_buffer_) {
-        delete[] f.data;
+        releaseFrameData(f);
     }
     frame_buffer_.clear();
 }
