@@ -20,6 +20,7 @@ set(RTSP_SDK_SOURCES
     src/rtsp-common/rtp_packer.cpp
     src/server/rtsp_server.cpp
     src/client/rtsp_client.cpp
+    src/publisher/rtsp_publisher.cpp
 )
 
 # 所有头文件（用于安装）
@@ -29,6 +30,8 @@ set(RTSP_SDK_HEADERS
     include/rtsp-server/rtsp-server.h
     include/rtsp-client/rtsp_client.h
     include/rtsp-client/rtsp-client.h
+    include/rtsp-publisher/rtsp_publisher.h
+    include/rtsp-publisher/rtsp-publisher.h
 )
 
 # 创建库（单一库）

@@ -57,13 +57,13 @@ struct RtspClientConfig {
  */
 struct MediaInfo {
     std::string control_url;    ///< 控制URL
-    CodecType codec;            ///< 编码类型
+    CodecType codec = CodecType::H264; ///< 编码类型
     std::string codec_name;     ///< 编码名称
-    uint32_t width;             ///< 视频宽度
-    uint32_t height;            ///< 视频高度
-    uint32_t fps;               ///< 帧率
-    uint32_t payload_type;      ///< RTP payload type
-    uint32_t clock_rate;        ///< 时钟频率（通常90000）
+    uint32_t width = 1920;      ///< 视频宽度
+    uint32_t height = 1080;     ///< 视频高度
+    uint32_t fps = 30;          ///< 帧率
+    uint32_t payload_type = 96; ///< RTP payload type
+    uint32_t clock_rate = 90000;///< 时钟频率（通常90000）
     std::vector<uint8_t> sps;   ///< SPS数据
     std::vector<uint8_t> pps;   ///< PPS数据
     std::vector<uint8_t> vps;   ///< VPS数据（仅HEVC）
@@ -76,9 +76,9 @@ struct SessionInfo {
     std::string session_id;           ///< 会话ID
     std::string base_url;             ///< 基础URL
     std::vector<MediaInfo> media_streams;  ///< 媒体流列表
-    uint64_t duration_ms;             ///< 时长（毫秒）
-    bool has_video;                   ///< 是否有视频
-    bool has_audio;                   ///< 是否有音频
+    uint64_t duration_ms = 0;         ///< 时长（毫秒）
+    bool has_video = false;           ///< 是否有视频
+    bool has_audio = false;           ///< 是否有音频
 };
 
 struct RtspClientStats {
@@ -93,7 +93,7 @@ struct RtspClientStats {
 /**
  * @brief 帧回调函数类型
  * 
- * @param frame 视频帧数据，回调结束后内存会被释放
+ * @param frame 视频帧数据，智能托管，无需手动释放
  * 
  * 注意：回调在内部线程中执行，不要阻塞太久
  */
@@ -240,6 +240,8 @@ public:
      * @brief 关闭连接
      */
     void close();
+    bool closeWithTimeout(uint32_t timeout_ms);
+    void interrupt();
 
     /**
      * @brief 发送OPTIONS请求
@@ -343,6 +345,7 @@ public:
      * @brief 关闭播放器
      */
     void close();
+    bool closeWithTimeout(uint32_t timeout_ms);
     
     /**
      * @brief 获取媒体信息

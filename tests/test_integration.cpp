@@ -6,12 +6,16 @@
 
 #include <rtsp-server/rtsp-server.h>
 #include <rtsp-client/rtsp-client.h>
+#include <rtsp-publisher/rtsp-publisher.h>
 #include <iostream>
 #include <cassert>
 #include <thread>
 #include <chrono>
 
 using namespace rtsp;
+
+namespace {
+} // namespace
 
 void test_server_init() {
     std::cout << "Testing server initialization..." << std::endl;
@@ -57,6 +61,22 @@ void test_server_start_stop() {
     assert(!server.isRunning());
     
     std::cout << "  Server start/stop tests passed!" << std::endl;
+}
+
+void test_server_singleton_factory() {
+    std::cout << "Testing server singleton factory..." << std::endl;
+    auto s1 = getOrCreateRtspServer(19570, "127.0.0.1");
+    auto s2 = getOrCreateRtspServer(19570, "0.0.0.0");
+    assert(s1);
+    assert(s2);
+    assert(s1.get() == s2.get());
+
+    assert(s1->addPath("/singleton", CodecType::H264));
+    assert(!s2->addPath("/singleton", CodecType::H264));
+    assert(s1->start());
+    assert(s2->isRunning());
+    assert(s2->stopWithTimeout(1000));
+    std::cout << "  Server singleton factory tests passed!" << std::endl;
 }
 
 void test_push_frame() {
@@ -413,12 +433,56 @@ void test_auto_parameter_set_extraction() {
     std::cout << "  Auto parameter-set extraction tests passed!" << std::endl;
 }
 
+void test_receive_interrupt_and_stop_timeout() {
+    std::cout << "Testing receive interrupt and stop timeout..." << std::endl;
+
+    RtspServer server;
+    assert(server.init("127.0.0.1", 18565));
+    assert(server.addPath("/live", CodecType::H264));
+    assert(server.start());
+
+    RtspClient client;
+    assert(client.open("rtsp://127.0.0.1:18565/live"));
+    assert(client.describe());
+    assert(client.setup(0));
+    assert(client.play(0));
+
+    std::atomic<bool> done{false};
+    std::thread waiter([&]() {
+        VideoFrame frame{};
+        bool ok = client.receiveFrame(frame, 15000);
+        assert(!ok);
+        done = true;
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    client.interrupt();
+    client.closeWithTimeout(1000);
+
+    waiter.join();
+    assert(done.load());
+    assert(server.stopWithTimeout(1000));
+    std::cout << "  Receive interrupt and stop timeout tests passed!" << std::endl;
+}
+
+void test_publish_client_api_smoke() {
+    std::cout << "Testing RTSP publish client API smoke..." << std::endl;
+    RtspPublisher pub;
+    RtspPublishConfig cfg;
+    cfg.local_rtp_port = 25000;
+    pub.setConfig(cfg);
+    assert(!pub.isConnected());
+    assert(!pub.isRecording());
+    std::cout << "  Publish client API smoke tests passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Integration Tests ===" << std::endl;
     
     try {
         test_server_init();
         test_server_start_stop();
+        test_server_singleton_factory();
         test_push_frame();
         test_push_raw_data();
         test_config_management();
@@ -428,6 +492,8 @@ int main() {
         test_tcp_interleaved_streaming();
         test_digest_auth();
         test_auto_parameter_set_extraction();
+        test_receive_interrupt_and_stop_timeout();
+        test_publish_client_api_smoke();
         
         std::cout << "\n=== All Integration Tests Passed! ===" << std::endl;
         return 0;

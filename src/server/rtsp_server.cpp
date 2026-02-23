@@ -19,6 +19,7 @@
 #include <vector>
 #include <regex>
 #include <unordered_map>
+#include <future>
 
 namespace rtsp {
 
@@ -124,6 +125,36 @@ VideoFrame cloneFrameManaged(const VideoFrame& src) {
     copy.data = copy.managed_data->empty() ? nullptr : copy.managed_data->data();
     copy.size = copy.managed_data->size();
     return copy;
+}
+
+bool joinThreadWithTimeout(std::thread& t, uint32_t timeout_ms) {
+    if (!t.joinable()) return true;
+    std::thread owned = std::move(t);
+    std::promise<void> done;
+    auto fut = done.get_future();
+    std::thread joiner([owned = std::move(owned), done = std::move(done)]() mutable {
+        if (owned.joinable()) {
+            owned.join();
+        }
+        done.set_value();
+    });
+    if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready) {
+        joiner.join();
+        return true;
+    }
+    joiner.detach();
+    return false;
+}
+
+struct ServerRegistry {
+    std::mutex mutex;
+    std::unordered_map<uint16_t, std::weak_ptr<RtspServer>> instances;
+    std::unordered_map<uint16_t, std::string> first_host;
+};
+
+ServerRegistry& globalServerRegistry() {
+    static ServerRegistry registry;
+    return registry;
 }
 
 } // namespace
@@ -1013,7 +1044,12 @@ bool RtspServer::start() {
 }
 
 void RtspServer::stop() {
+    stopWithTimeout(5000);
+}
+
+bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
     impl_->running_ = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     
     if (impl_->tcp_server_) {
         impl_->tcp_server_->stop();
@@ -1027,23 +1063,39 @@ void RtspServer::stop() {
             }
         }
     }
+    bool all_joined = true;
     {
         std::lock_guard<std::mutex> lock(impl_->connections_mutex_);
         for (auto& c : impl_->connections_) {
-            if (c.thread.joinable()) {
-                c.thread.join();
+            uint32_t remain = 0;
+            auto now = std::chrono::steady_clock::now();
+            if (now < deadline) {
+                remain = static_cast<uint32_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+            }
+            if (!joinThreadWithTimeout(c.thread, remain)) {
+                all_joined = false;
             }
         }
         impl_->connections_.clear();
     }
-    
-    if (impl_->cleanup_thread_.joinable()) {
-        impl_->cleanup_thread_.join();
+
+    {
+        uint32_t remain = 0;
+        auto now = std::chrono::steady_clock::now();
+        if (now < deadline) {
+            remain = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+        }
+        if (!joinThreadWithTimeout(impl_->cleanup_thread_, remain)) {
+            all_joined = false;
+        }
     }
     
     // 清理所有路径
     std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
     impl_->paths_.clear();
+    return all_joined;
 }
 
 bool RtspServer::isRunning() const {
@@ -1239,6 +1291,30 @@ void freeVideoFrame(VideoFrame& frame) {
     frame.managed_data.reset();
     frame.data = nullptr;
     frame.size = 0;
+}
+
+std::shared_ptr<RtspServer> getOrCreateRtspServer(uint16_t port, const std::string& host) {
+    auto& registry = globalServerRegistry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+
+    auto it = registry.instances.find(port);
+    if (it != registry.instances.end()) {
+        if (auto existing = it->second.lock()) {
+            auto h = registry.first_host.find(port);
+            if (h != registry.first_host.end() && h->second != host) {
+                RTSP_LOG_WARNING("getOrCreateRtspServer reused existing server on port " +
+                                 std::to_string(port) + ", keep first host=" + h->second);
+            }
+            return existing;
+        }
+        registry.instances.erase(it);
+    }
+
+    auto server = std::make_shared<RtspServer>();
+    server->init(host, port);
+    registry.instances[port] = server;
+    registry.first_host[port] = host;
+    return server;
 }
 
 } // namespace rtsp

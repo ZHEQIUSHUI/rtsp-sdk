@@ -19,6 +19,12 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
   - Automatic RTP packet reception, reordering and decoding
   - URL auth parsing (`rtsp://user:pass@host/path`)
   - UDP/TCP setup fallback
+  - `receiveFrame/receiveLoop` interrupt support (`interrupt/closeWithTimeout`)
+
+- **RTSP Publish Client**:
+  - Supports `ANNOUNCE/SETUP/RECORD/TEARDOWN`
+  - Can push H.264/H.265 to external RTSP servers (e.g. mediamtx)
+  - Main class is `RtspPublisher` (`RtspPusher` is alias)
 
 - **RTP Robustness**:
   - H.264 STAP-A/STAP-B aggregation support
@@ -91,8 +97,12 @@ The script writes `server.log`, `client.log`, and markdown report under `soak_re
 using namespace rtsp;
 
 int main() {
+    // Option A: explicit instance
     RtspServer server;
     server.init("0.0.0.0", 8554);
+
+    // Option B: port-based singleton instance
+    // auto server_ptr = getOrCreateRtspServer(8554, "0.0.0.0");
 
     // Add media path
     PathConfig config;
@@ -145,11 +155,8 @@ int main() {
     
     // Connect and play
     if (player.open("rtsp://192.168.1.100:8554/live/stream")) {
-        player.play();
-        
         std::this_thread::sleep_for(std::chrono::seconds(30));
-        
-        player.stop();
+        player.close();
     }
     
     return 0;
@@ -161,8 +168,9 @@ int main() {
 ### Server API
 
 - `bool init(const std::string& host, uint16_t port)` - Initialize server
+- `getOrCreateRtspServer(port, host)` - Port-based singleton factory (host only effective on first call)
 - `bool addPath(const PathConfig& config)` - Add media path
-- `bool start()` / `void stop()` - Control server
+- `bool start()` / `void stop()` / `bool stopWithTimeout(ms)` - Control server
 - `bool pushH264Data(path, data, size, pts, is_key)` - Push H.264 Annex-B frame
 - `bool pushH265Data(path, data, size, pts, is_key)` - Push H.265 Annex-B frame
 - `void setAuth(user, pass)` / `setAuthDigest(user, pass)` - Enable auth
@@ -173,7 +181,16 @@ int main() {
 - `bool open(url)` / `void close()` - Connect/disconnect
 - `bool describe()` / `bool setup()` / `bool play()` - RTSP control flow
 - `bool receiveFrame(frame, timeout_ms)` - Blocking receive
+- `void interrupt()` / `bool closeWithTimeout(ms)` - stop-safe interrupt/close
 - `RtspClientStats getStats()` - Runtime metrics
+
+### Publish API
+
+- `RtspPublisher::open(url)` - Connect to publish endpoint
+- `announce(media)` / `setup()` / `record()` - Publish handshake
+- `pushH264Data(...)` / `pushH265Data(...)` - Push encoded frames
+- `closeWithTimeout(ms)` - stop-safe close
+- `RtspPusher` - alias of `RtspPublisher`
 
 ## Project Structure
 
@@ -185,6 +202,9 @@ include/
   rtsp-client/        # Client public headers
     rtsp-client.h
     rtsp_client.h
+  rtsp-publisher/     # Publish client public headers
+    rtsp-publisher.h
+    rtsp_publisher.h
   rtsp-common/        # Common public headers
     common.h
 
@@ -196,6 +216,7 @@ src/
     socket.cpp/h
   server/             # Server implementation
   client/             # Client implementation
+  publisher/          # RTSP publish implementation
 
 examples/             # Example applications
 tests/                # Unit tests

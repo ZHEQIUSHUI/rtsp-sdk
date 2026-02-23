@@ -11,6 +11,7 @@
 #include <map>
 #include <unordered_map>
 #include <iomanip>
+#include <future>
 
 namespace rtsp {
 
@@ -36,6 +37,30 @@ void releaseFrameData(VideoFrame& frame) {
     frame.managed_data.reset();
     frame.data = nullptr;
     frame.size = 0;
+}
+
+bool joinThreadWithTimeout(std::thread& t, uint32_t timeout_ms) {
+    if (!t.joinable()) {
+        return true;
+    }
+
+    std::thread owned = std::move(t);
+    std::promise<void> done;
+    auto fut = done.get_future();
+    std::thread joiner([owned = std::move(owned), done = std::move(done)]() mutable {
+        if (owned.joinable()) {
+            owned.join();
+        }
+        done.set_value();
+    });
+
+    if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready) {
+        joiner.join();
+        return true;
+    }
+
+    joiner.detach();
+    return false;
 }
 
 } // namespace
@@ -470,6 +495,7 @@ public:
     bool connected_ = false;
     bool playing_ = false;
     bool receiver_started_ = false;
+    std::atomic<bool> stop_waiting_{false};
     std::thread tcp_receive_thread_;
     std::atomic<bool> tcp_receive_running_{false};
     std::atomic<uint64_t> auth_retries_{0};
@@ -544,11 +570,9 @@ public:
         }
     }
 
-    void stopTcpReceiverThread() {
+    bool stopTcpReceiverThread(uint32_t timeout_ms) {
         tcp_receive_running_ = false;
-        if (tcp_receive_thread_.joinable()) {
-            tcp_receive_thread_.join();
-        }
+        return joinThreadWithTimeout(tcp_receive_thread_, timeout_ms);
     }
 
     bool recvExact(uint8_t* out, size_t n, int timeout_ms) {
@@ -642,6 +666,18 @@ public:
                     current_media->height = std::stoi(match[3]);
                 }
             }
+            else if (line.find("a=cliprect:") == 0 && current_media) {
+                std::regex clip_regex("a=cliprect:\\d+,\\d+,(\\d+),(\\d+)");
+                std::smatch match;
+                if (std::regex_search(line, match, clip_regex)) {
+                    const uint32_t h = static_cast<uint32_t>(std::stoul(match[1].str()));
+                    const uint32_t w = static_cast<uint32_t>(std::stoul(match[2].str()));
+                    if (w > 0 && h > 0) {
+                        current_media->width = w;
+                        current_media->height = h;
+                    }
+                }
+            }
             else if (line.find("a=framerate:") == 0 && current_media) {
                 std::regex fr_regex("a=framerate:(\\d+(?:\\.\\d+)?)");
                 std::smatch match;
@@ -672,6 +708,16 @@ public:
                 if (std::regex_search(line, match, h265_pps)) {
                     current_media->pps = base64Decode(match[1].str());
                 }
+            }
+        }
+
+        for (auto& media : session_info_.media_streams) {
+            if (media.width == 0) media.width = 1920;
+            if (media.height == 0) media.height = 1080;
+            if (media.fps == 0) media.fps = 30;
+            if (media.clock_rate == 0) media.clock_rate = 90000;
+            if (media.payload_type == 0) {
+                media.payload_type = (media.codec == CodecType::H265) ? 97 : 96;
             }
         }
         
@@ -831,6 +877,7 @@ bool RtspClient::open(const std::string& url) {
     }
 
     impl_->connected_ = true;
+    impl_->stop_waiting_ = false;
     return true;
 }
 
@@ -976,6 +1023,7 @@ bool RtspClient::play(uint64_t start_time_ms) {
     }
 
     impl_->playing_ = true;
+    impl_->stop_waiting_ = false;
     if (impl_->rtp_receiver_ && !impl_->receiver_started_) {
         if (impl_->use_tcp_transport_) {
             impl_->tcp_receive_running_ = true;
@@ -995,7 +1043,7 @@ bool RtspClient::pause() {
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
 
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread();
+        impl_->stopTcpReceiverThread(1000);
         impl_->receiver_started_ = false;
     }
 
@@ -1005,6 +1053,8 @@ bool RtspClient::pause() {
     bool ok = impl_->sendRequest("PAUSE", impl_->request_url_, extra.str(), "", response);
     
     impl_->playing_ = false;
+    impl_->stop_waiting_ = true;
+    impl_->queue_cv_.notify_all();
     if (!impl_->use_tcp_transport_ && impl_->rtp_receiver_ && impl_->receiver_started_) {
         impl_->rtp_receiver_->stop();
         impl_->receiver_started_ = false;
@@ -1016,7 +1066,7 @@ bool RtspClient::teardown() {
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
 
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread();
+        impl_->stopTcpReceiverThread(1000);
         impl_->receiver_started_ = false;
     }
 
@@ -1026,6 +1076,8 @@ bool RtspClient::teardown() {
     impl_->sendRequest("TEARDOWN", impl_->request_url_, extra.str(), "", response, false);
 
     impl_->playing_ = false;
+    impl_->stop_waiting_ = true;
+    impl_->queue_cv_.notify_all();
     impl_->session_id_.clear();
     
     if (impl_->rtp_receiver_) {
@@ -1037,8 +1089,11 @@ bool RtspClient::teardown() {
 }
 
 void RtspClient::receiveLoop() {
-    while (impl_->playing_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::unique_lock<std::mutex> lock(impl_->queue_mutex_);
+    while (!impl_->stop_waiting_ && impl_->playing_) {
+        impl_->queue_cv_.wait_for(lock, std::chrono::milliseconds(200), [this] {
+            return impl_->stop_waiting_ || !impl_->playing_ || !impl_->frame_queue_.empty();
+        });
     }
 }
 
@@ -1046,7 +1101,7 @@ bool RtspClient::receiveFrame(VideoFrame& frame, int timeout_ms) {
     std::unique_lock<std::mutex> lock(impl_->queue_mutex_);
     
     if (!impl_->queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-        [this] { return !impl_->frame_queue_.empty() || !impl_->playing_; })) {
+        [this] { return !impl_->frame_queue_.empty() || !impl_->playing_ || impl_->stop_waiting_; })) {
         return false;
     }
 
@@ -1066,9 +1121,13 @@ bool RtspClient::isPlaying() const {
 }
 
 void RtspClient::close() {
+    closeWithTimeout(5000);
+}
+
+bool RtspClient::closeWithTimeout(uint32_t timeout_ms) {
     teardown();
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread();
+        impl_->stopTcpReceiverThread(timeout_ms);
         impl_->receiver_started_ = false;
     }
     
@@ -1079,6 +1138,22 @@ void RtspClient::close() {
     impl_->connected_ = false;
     impl_->playing_ = false;
     impl_->receiver_started_ = false;
+    impl_->stop_waiting_ = true;
+    {
+        std::lock_guard<std::mutex> lock(impl_->queue_mutex_);
+        while (!impl_->frame_queue_.empty()) {
+            auto& f = impl_->frame_queue_.front();
+            releaseFrameData(f);
+            impl_->frame_queue_.pop();
+        }
+    }
+    impl_->queue_cv_.notify_all();
+    return true;
+}
+
+void RtspClient::interrupt() {
+    impl_->stop_waiting_ = true;
+    impl_->queue_cv_.notify_all();
 }
 
 bool RtspClient::sendOptions() {
@@ -1092,7 +1167,7 @@ bool RtspClient::sendGetParameter(const std::string& param) {
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
     bool restart_tcp_receiver = false;
     if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
-        impl_->stopTcpReceiverThread();
+        impl_->stopTcpReceiverThread(1000);
         impl_->receiver_started_ = false;
         restart_tcp_receiver = impl_->playing_;
     }
@@ -1220,21 +1295,24 @@ bool SimpleRtspPlayer::readFrame(VideoFrame& frame) {
 }
 
 void SimpleRtspPlayer::close() {
+    closeWithTimeout(5000);
+}
+
+bool SimpleRtspPlayer::closeWithTimeout(uint32_t timeout_ms) {
     running_ = false;
     buffer_cv_.notify_all();
     
-    if (receive_thread_.joinable()) {
-        receive_thread_.join();
-    }
+    bool joined = joinThreadWithTimeout(receive_thread_, timeout_ms);
     
     if (client_) {
-        client_->close();
+        client_->closeWithTimeout(timeout_ms);
     }
     
     for (auto& f : frame_buffer_) {
         releaseFrameData(f);
     }
     frame_buffer_.clear();
+    return joined;
 }
 
 bool SimpleRtspPlayer::isRunning() const {

@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <functional>
+#include <cstdint>
 
 namespace rtsp {
 
@@ -72,6 +73,7 @@ public:
     // 启动/停止服务器
     bool start();
     void stop();
+    bool stopWithTimeout(uint32_t timeout_ms);
     bool isRunning() const;
     
     // 添加媒体路径
@@ -116,5 +118,10 @@ VideoFrame createVideoFrame(CodecType codec, const uint8_t* data, size_t size,
 
 // 工具函数：显式释放视频帧内存（可选）
 void freeVideoFrame(VideoFrame& frame);
+
+// 端口级单例工厂：同一 port 仅返回同一个 RtspServer 实例。
+// host 仅在该 port 首次创建时生效；后续同 port 调用将复用首次 host。
+std::shared_ptr<RtspServer> getOrCreateRtspServer(uint16_t port,
+                                                  const std::string& host = "0.0.0.0");
 
 } // namespace rtsp
