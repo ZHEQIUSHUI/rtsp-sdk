@@ -7,11 +7,18 @@
 #include <rtsp-server/rtsp-server.h>
 #include <rtsp-client/rtsp-client.h>
 #include <rtsp-publisher/rtsp-publisher.h>
+#include <rtsp-common/socket.h>
 #include <iostream>
 #include <cassert>
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <mutex>
+#include <regex>
+#include <string>
+#include <vector>
 #ifndef _WIN32
 #include <dirent.h>
 #endif
@@ -19,6 +26,201 @@
 using namespace rtsp;
 
 namespace {
+struct MockPublishRtspServer {
+    explicit MockPublishRtspServer(uint16_t port, uint16_t rtp_port)
+        : rtsp_port(port), server_rtp_port(rtp_port) {}
+
+    void start() {
+        running = true;
+        thread = std::thread([this]() { run(); });
+    }
+
+    void stop() {
+        running = false;
+        {
+            std::lock_guard<std::mutex> lock(sock_mutex);
+            if (accepted_socket) {
+                accepted_socket->close();
+            }
+            udp_socket.close();
+            listen_socket.close();
+        }
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    ~MockPublishRtspServer() {
+        stop();
+    }
+
+    bool gotRtpPacket() const {
+        return received_rtp.load();
+    }
+
+private:
+    static int parseCseq(const std::string& req) {
+        std::regex cseq_re("CSeq:\\s*(\\d+)", std::regex::icase);
+        std::smatch m;
+        if (std::regex_search(req, m, cseq_re)) {
+            return std::stoi(m[1].str());
+        }
+        return 1;
+    }
+
+    static int parseClientRtpPort(const std::string& req) {
+        std::regex port_re("client_port=(\\d+)-(\\d+)", std::regex::icase);
+        std::smatch m;
+        if (std::regex_search(req, m, port_re)) {
+            return std::stoi(m[1].str());
+        }
+        return 0;
+    }
+
+    static std::string toLower(std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return s;
+    }
+
+    static bool tryPopRequest(std::string& buffer, std::string& out) {
+        size_t header_end_pos = buffer.find("\r\n\r\n");
+        if (header_end_pos == std::string::npos) {
+            return false;
+        }
+        const size_t header_len = header_end_pos + 4;
+        size_t content_length = 0;
+        std::string headers_lower = toLower(buffer.substr(0, header_len));
+        size_t cl_pos = headers_lower.find("content-length:");
+        if (cl_pos != std::string::npos) {
+            size_t cl_line_end = headers_lower.find("\r\n", cl_pos);
+            if (cl_line_end != std::string::npos) {
+                std::string cl = headers_lower.substr(cl_pos + 15, cl_line_end - (cl_pos + 15));
+                try {
+                    content_length = static_cast<size_t>(std::stoul(cl));
+                } catch (...) {
+                    content_length = 0;
+                }
+            }
+        }
+        if (buffer.size() < header_len + content_length) {
+            return false;
+        }
+        out = buffer.substr(0, header_len + content_length);
+        buffer.erase(0, header_len + content_length);
+        return true;
+    }
+
+    static std::string readRequest(Socket& sock, std::string& pending) {
+        uint8_t tmp[4096];
+        std::string req;
+        if (tryPopRequest(pending, req)) {
+            return req;
+        }
+        while (true) {
+            ssize_t n = sock.recv(tmp, sizeof(tmp), 200);
+            if (n > 0) {
+                pending.append(reinterpret_cast<const char*>(tmp), static_cast<size_t>(n));
+                if (tryPopRequest(pending, req)) {
+                    return req;
+                }
+                continue;
+            }
+            if (n == 0) {
+                continue;
+            }
+            return "";
+        }
+    }
+
+    static std::string response200(int cseq, const std::string& headers = "") {
+        std::string resp = "RTSP/1.0 200 OK\r\n";
+        resp += "CSeq: " + std::to_string(cseq) + "\r\n";
+        resp += headers;
+        resp += "\r\n";
+        return resp;
+    }
+
+    void run() {
+        if (!listen_socket.bind("127.0.0.1", rtsp_port)) return;
+        if (!listen_socket.listen()) return;
+        listen_socket.setNonBlocking(true);
+
+        while (running) {
+            auto s = listen_socket.accept();
+            if (s) {
+                std::lock_guard<std::mutex> lock(sock_mutex);
+                accepted_socket = std::move(s);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!accepted_socket) return;
+
+        std::string pending;
+        const std::string session = "pub-session-1";
+        while (running) {
+            std::string req = readRequest(*accepted_socket, pending);
+            if (req.empty()) break;
+            int cseq = parseCseq(req);
+            if (req.find("ANNOUNCE ") == 0) {
+                auto resp = response200(cseq);
+                accepted_socket->send(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
+            } else if (req.find("SETUP ") == 0) {
+                int client_rtp_port = parseClientRtpPort(req);
+                if (client_rtp_port <= 0) {
+                    std::string bad = "RTSP/1.0 400 Bad Request\r\nCSeq: " + std::to_string(cseq) + "\r\n\r\n";
+                    accepted_socket->send(reinterpret_cast<const uint8_t*>(bad.data()), bad.size());
+                    continue;
+                }
+                if (!udp_socket.isValid()) {
+                    (void)udp_socket.bindUdp("127.0.0.1", server_rtp_port);
+                    udp_socket.setNonBlocking(true);
+                }
+                std::string headers = "Transport: RTP/AVP;unicast;client_port=" +
+                                      std::to_string(client_rtp_port) + "-" + std::to_string(client_rtp_port + 1) +
+                                      ";server_port=" + std::to_string(server_rtp_port) + "-" + std::to_string(server_rtp_port + 1) + "\r\n" +
+                                      "Session: " + session + "\r\n";
+                auto resp = response200(cseq, headers);
+                accepted_socket->send(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
+            } else if (req.find("RECORD ") == 0) {
+                std::string headers = "Session: " + session + "\r\n";
+                auto resp = response200(cseq, headers);
+                accepted_socket->send(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
+
+                uint8_t buf[2048];
+                std::string from_ip;
+                uint16_t from_port = 0;
+                for (int i = 0; i < 200 && running && !received_rtp.load(); ++i) {
+                    ssize_t n = udp_socket.recvFrom(buf, sizeof(buf), from_ip, from_port);
+                    if (n > 0) {
+                        received_rtp = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            } else if (req.find("TEARDOWN ") == 0) {
+                auto resp = response200(cseq, "Session: " + session + "\r\n");
+                accepted_socket->send(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
+                break;
+            } else {
+                auto resp = response200(cseq);
+                accepted_socket->send(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
+            }
+        }
+    }
+
+    uint16_t rtsp_port;
+    uint16_t server_rtp_port;
+    std::atomic<bool> running{false};
+    std::atomic<bool> received_rtp{false};
+    std::thread thread;
+    std::mutex sock_mutex;
+    Socket listen_socket;
+    Socket udp_socket;
+    std::unique_ptr<Socket> accepted_socket;
+};
 } // namespace
 
 void test_server_init() {
@@ -575,6 +777,57 @@ void test_publish_client_api_smoke() {
     std::cout << "  Publish client API smoke tests passed!" << std::endl;
 }
 
+void test_publish_client_to_mock_server() {
+    std::cout << "Testing RTSP publisher to mock server..." << std::endl;
+    MockPublishRtspServer mock(18569, 31000);
+    mock.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    RtspPublisher pub;
+    RtspPublishConfig cfg;
+    cfg.local_rtp_port = 25020;
+    pub.setConfig(cfg);
+    assert(pub.open("rtsp://127.0.0.1:18569/live/publish"));
+
+    PublishMediaInfo media;
+    media.codec = CodecType::H264;
+    media.payload_type = 96;
+    media.width = 640;
+    media.height = 480;
+    media.fps = 25;
+    media.sps = {0x67, 0x42, 0x00, 0x28};
+    media.pps = {0x68, 0xCE, 0x3C, 0x80};
+    media.control_track = "streamid=0";
+    assert(pub.announce(media));
+    assert(pub.setup());
+    assert(pub.record());
+
+    const std::vector<uint8_t> idr = {
+        0x00, 0x00, 0x00, 0x01,
+        0x67, 0x42, 0x00, 0x28,
+        0x00, 0x00, 0x00, 0x01,
+        0x68, 0xCE, 0x3C, 0x80,
+        0x00, 0x00, 0x00, 0x01,
+        0x65, 0x88, 0x84, 0x21
+    };
+    assert(pub.pushH264Data(idr.data(), idr.size(), 0, true));
+
+    bool got = false;
+    for (int i = 0; i < 50; ++i) {
+        if (mock.gotRtpPacket()) {
+            got = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    assert(got);
+
+    assert(pub.teardown());
+    pub.close();
+    mock.stop();
+    std::cout << "  RTSP publisher to mock server tests passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Integration Tests ===" << std::endl;
     
@@ -595,6 +848,7 @@ int main() {
         test_stop_latency_under_2s();
         test_open_play_stop_50_loops();
         test_publish_client_api_smoke();
+        test_publish_client_to_mock_server();
         
         std::cout << "\n=== All Integration Tests Passed! ===" << std::endl;
         return 0;
