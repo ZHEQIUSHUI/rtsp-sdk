@@ -41,6 +41,11 @@ else()
     add_library(rtsp-sdk STATIC ${RTSP_SDK_SOURCES})
 endif()
 
+# Make the static archive safe to link into downstream shared libraries.
+set_target_properties(rtsp-sdk PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
 # 包含目录
 target_include_directories(rtsp-sdk
     PUBLIC
