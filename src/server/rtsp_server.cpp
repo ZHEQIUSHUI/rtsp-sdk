@@ -982,13 +982,39 @@ public:
             ssize_t n = socket_->recv(temp, sizeof(temp), 1000);
             if (n > 0) {
                 buffer.append((char*)temp, n);
-                
-                // 检查是否收到完整请求
-                size_t pos;
-                while ((pos = buffer.find("\r\n\r\n")) != std::string::npos) {
+
+                // TCP interleaved mode: the client may send interleaved RTP/RTCP packets (start with '$')
+                // on the control socket. If we try to parse these bytes as RTSP text, we may emit bogus
+                // RTSP responses and make players (ffmpeg/ffplay) tear down the session.
+                //
+                // We only need to consume/ignore these packets to keep the RTSP request parser in sync.
+                while (!buffer.empty()) {
+                    if (buffer[0] == '$') {
+                        if (buffer.size() < 4) {
+                            break;  // wait more data
+                        }
+                        const std::uint16_t len =
+                            (static_cast<std::uint8_t>(buffer[2]) << 8U) |
+                            static_cast<std::uint8_t>(buffer[3]);
+                        const std::size_t total = 4U + static_cast<std::size_t>(len);
+                        if (buffer.size() < total) {
+                            break;  // wait more data
+                        }
+                        buffer.erase(0, total);
+                        if (session_) {
+                            session_->last_activity = std::chrono::steady_clock::now();
+                        }
+                        continue;
+                    }
+
+                    // 检查是否收到完整请求
+                    const size_t pos = buffer.find("\r\n\r\n");
+                    if (pos == std::string::npos) {
+                        break;
+                    }
                     size_t content_length = 0;
                     size_t header_end = pos + 4;
-                    
+
                     // 解析Content-Length
                     std::string header = buffer.substr(0, header_end);
                     std::string header_lower = header;
@@ -1007,16 +1033,16 @@ public:
                             }
                         }
                     }
-                    
+
                     // 检查是否有足够的主体数据
                     if (buffer.size() < header_end + content_length) {
                         break;
                     }
-                    
+
                     // 处理请求
                     std::string request_data = buffer.substr(0, header_end + content_length);
                     buffer.erase(0, header_end + content_length);
-                    
+
                     processRequest(request_data);
                 }
             } else if (n == 0) {

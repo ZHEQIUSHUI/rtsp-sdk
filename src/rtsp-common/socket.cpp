@@ -305,7 +305,17 @@ ssize_t Socket::recv(uint8_t* buffer, size_t size, int timeout_ms) {
         pfd.events = POLLIN;
         
         int res = poll(&pfd, 1, timeout_ms);
-        if (res <= 0) return res;
+        if (res == 0) {
+            // Timeout. Return -1 so callers can treat this as "no data yet" instead of
+            // "connection closed" (recv(2) would return 0 only when peer closed).
+#ifndef _WIN32
+            errno = EAGAIN;
+#endif
+            return -1;
+        }
+        if (res < 0) {
+            return -1;
+        }
     }
 
     return ::recv(impl_->fd_, (char*)buffer, size, 0);

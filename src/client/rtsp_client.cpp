@@ -658,9 +658,11 @@ public:
             if (r > 0) {
                 off += static_cast<size_t>(r);
             } else if (r == 0) {
-                continue;
-            } else {
+                // Peer closed.
                 return false;
+            } else {
+                // Timeout or transient error.
+                continue;
             }
         }
         return off == n;

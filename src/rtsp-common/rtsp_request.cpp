@@ -395,7 +395,6 @@ RtspResponse RtspResponse::createSetup(int cseq, const std::string& session_id,
 RtspResponse RtspResponse::createPlay(int cseq, const std::string& session_id) {
     RtspResponse resp(cseq);
     resp.setSession(session_id);
-    resp.setHeader("Range", "npt=0.000-");
     return resp;
 }
 
