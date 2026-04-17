@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <future>
 #include <algorithm>
+#include <cctype>
 
 namespace rtsp {
 
@@ -528,6 +529,7 @@ public:
     std::string server_host_;
     uint16_t server_port_ = 554;
     std::string server_path_;
+    std::string setup_control_url_;
     std::string auth_user_;
     std::string auth_pass_;
     std::string basic_auth_header_;
@@ -717,6 +719,10 @@ public:
                 std::string type, port, proto, pt;
                 iss >> type >> port >> proto >> pt;
                 current_media->payload_type = std::stoi(pt);
+            } else if (line.rfind("m=", 0) == 0) {
+                // Only parse attributes for the currently active video media section.
+                // When another media section starts (e.g. audio), stop mutating video fields.
+                current_media = nullptr;
             }
             else if (line.find("a=rtpmap:") == 0 && current_media) {
                 std::regex rtpmap_regex("a=rtpmap:(\\d+)\\s+(\\w+)/(\\d+)");
@@ -798,7 +804,6 @@ public:
                 media.payload_type = (media.codec == CodecType::H265) ? 97 : 96;
             }
         }
-        
         return true;
     }
 
@@ -1014,7 +1019,6 @@ bool RtspClient::setup(int stream_index) {
     if (control_url.find("rtsp://") != 0) {
         control_url = impl_->request_url_ + "/" + control_url;
     }
-
     auto do_setup = [&](bool use_tcp, std::string& response_out) -> bool {
         uint16_t selected_rtp_port = 0;
         if (use_tcp) {
@@ -1094,11 +1098,11 @@ bool RtspClient::setup(int stream_index) {
             impl_->interleaved_rtcp_channel_ = static_cast<uint8_t>(std::stoi(tm[2].str()));
         }
     }
-
     impl_->rtp_receiver_->setVideoInfo(media.codec, media.width, media.height, media.fps, static_cast<uint8_t>(media.payload_type));
     impl_->rtp_receiver_->setCallback([this](const VideoFrame& frame) {
         impl_->onFrame(frame);
     });
+    impl_->setup_control_url_ = control_url;
 
     impl_->setState(Impl::ClientState::Setup);
     return true;
@@ -1107,19 +1111,25 @@ bool RtspClient::setup(int stream_index) {
 bool RtspClient::play(uint64_t start_time_ms) {
     if (impl_->isClosing()) return false;
     if (!impl_->connected_ || impl_->session_id_.empty()) return false;
+    const std::string play_url_primary = impl_->request_url_;
+    const bool has_secondary_url =
+        !impl_->setup_control_url_.empty() && impl_->setup_control_url_ != play_url_primary;
 
     std::ostringstream extra;
     extra << "Session: " << impl_->session_id_ << "\r\n";
     if (start_time_ms > 0) {
         extra << "Range: npt=" << (start_time_ms / 1000.0) << "-\r\n";
-    } else {
-        extra << "Range: npt=0.000-\r\n";
     }
-    std::string response;
-    if (!impl_->sendRequest("PLAY", impl_->request_url_, extra.str(), "", response)) {
-        return false;
+    std::string response_primary;
+    bool play_ok = impl_->sendRequest("PLAY", play_url_primary, extra.str(), "", response_primary) &&
+                   response_primary.find("200 OK") != std::string::npos;
+
+    if (!play_ok && has_secondary_url) {
+        std::string response_secondary;
+        play_ok = impl_->sendRequest("PLAY", impl_->setup_control_url_, extra.str(), "", response_secondary) &&
+                  response_secondary.find("200 OK") != std::string::npos;
     }
-    if (response.find("200 OK") == std::string::npos) {
+    if (!play_ok) {
         return false;
     }
 
@@ -1137,7 +1147,6 @@ bool RtspClient::play(uint64_t start_time_ms) {
         }
         impl_->receiver_started_ = true;
     }
-    
     return true;
 }
 
@@ -1189,6 +1198,7 @@ bool RtspClient::teardown() {
     impl_->playing_ = false;
     impl_->wakeFrameWaiters();
     impl_->session_id_.clear();
+    impl_->setup_control_url_.clear();
     
     if (impl_->rtp_receiver_) {
         impl_->rtp_receiver_->stop();
@@ -1293,6 +1303,7 @@ bool RtspClient::closeWithTimeout(uint32_t timeout_ms) {
     impl_->receiver_started_ = false;
     impl_->stop_waiting_ = true;
     impl_->session_id_.clear();
+    impl_->setup_control_url_.clear();
     {
         std::lock_guard<std::mutex> lock(impl_->queue_mutex_);
         while (!impl_->frame_queue_.empty()) {
