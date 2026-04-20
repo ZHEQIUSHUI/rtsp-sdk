@@ -940,7 +940,10 @@ public:
 RtspClient::RtspClient() : impl_(std::make_unique<Impl>()) {}
 
 RtspClient::~RtspClient() {
-    close();
+    // Avoid noisy close logs when the client was never opened/connected.
+    if (impl_ && (impl_->connected_ || impl_->playing_)) {
+        close();
+    }
 }
 
 void RtspClient::setConfig(const RtspClientConfig& config) {
