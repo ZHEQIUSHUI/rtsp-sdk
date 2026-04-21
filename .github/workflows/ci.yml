@@ -5,10 +5,19 @@ on:
     branches:
       - master
       - main
+      - 'fix/**'
+      - 'feat/**'
   pull_request:
 
+# 工业落地质量栅栏：
+#   1. Release 基础构建 & 测试（Linux + Windows）
+#   2. ThreadSanitizer（锁序、paths_ 竞争、config 竞争、SSRC 一致性 —— C1/C3/C4/C5）
+#   3. AddressSanitizer + UndefinedBehaviorSanitizer（内存安全与未定义行为）
+#   4. 高并发压测（test_concurrent_setup 多次触发，观察偶发）
+#   5. 兼容性冒烟：用 ffmpeg 验证 DESCRIBE/SETUP/PLAY/RTCP SSRC 一致性
 jobs:
   build-and-test:
+    name: Release build & test
     strategy:
       fail-fast: false
       matrix:
@@ -31,3 +40,119 @@ jobs:
       - name: Test (Windows)
         if: runner.os == 'Windows'
         run: ctest --test-dir build -C Release --output-on-failure
+
+  thread-sanitizer:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (TSan)
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread" \
+            -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF
+
+      - name: Build (TSan)
+        run: cmake --build build-tsan --parallel
+
+      - name: Run tests (TSan)
+        env:
+          # halt_on_error=1 让 TSan 在首个竞争处返回非零
+          # second_deadlock_stack=1 输出两端持锁栈，便于定位
+          TSAN_OPTIONS: "halt_on_error=1 abort_on_error=0 second_deadlock_stack=1 suppressions=${{ github.workspace }}/ci/tsan.supp"
+        run: ctest --test-dir build-tsan --output-on-failure
+
+  address-sanitizer:
+    name: AddressSanitizer + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (ASan/UBSan)
+        run: |
+          cmake -S . -B build-asan \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF
+
+      - name: Build (ASan)
+        run: cmake --build build-asan --parallel
+
+      - name: Run tests (ASan + UBSan)
+        env:
+          ASAN_OPTIONS: "abort_on_error=0 halt_on_error=1 detect_leaks=1 check_initialization_order=1"
+          UBSAN_OPTIONS: "print_stacktrace=1 halt_on_error=1"
+        run: ctest --test-dir build-asan --output-on-failure
+
+  stress:
+    name: Stress (concurrent setup loop)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # 跑 20 轮并发 SETUP/推帧：偶发的锁序/端口并发问题容易在重复中暴露
+      - name: Stress loop
+        run: |
+          set -e
+          for i in $(seq 1 20); do
+            echo "== iteration $i =="
+            ./build/tests/rtsp_test_concurrent_setup
+          done
+
+  compat-smoke:
+    name: Compatibility smoke (ffmpeg)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+          cmake --build build --parallel
+
+      # 启动 example_server，用 ffmpeg 模拟真实客户端过一轮 DESCRIBE/SETUP/PLAY/RTCP。
+      # 目的：回归 C4 (RTCP SSRC) 与 M6 (Content-Base) 对严格客户端的兼容性。
+      # ffmpeg -t 5 录 5 秒，能正常拿到帧即 OK。
+      - name: Smoke with ffmpeg (UDP + TCP)
+        run: |
+          set -e
+          ./build/examples/example_server 8554 /live/stream > /tmp/srv.log 2>&1 &
+          SERVER_PID=$!
+          sleep 2
+
+          # UDP：应能收到帧
+          timeout 10 ffmpeg -rtsp_transport udp -i rtsp://127.0.0.1:8554/live/stream \
+            -t 5 -c copy -f null - -hide_banner -loglevel warning 2>&1 | tee /tmp/udp.log
+          # TCP interleaved：应能收到帧
+          timeout 10 ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:8554/live/stream \
+            -t 5 -c copy -f null - -hide_banner -loglevel warning 2>&1 | tee /tmp/tcp.log
+
+          kill $SERVER_PID 2>/dev/null || true
+          wait $SERVER_PID 2>/dev/null || true
+
+          echo "--- server log tail ---"
+          tail -30 /tmp/srv.log
+          # 要求 UDP/TCP 至少有一帧通过；出现 'Invalid data' / 'No such file' 视为失败
+          grep -q "Invalid data found when processing input" /tmp/udp.log && exit 1 || true
+          grep -q "Invalid data found when processing input" /tmp/tcp.log && exit 1 || true

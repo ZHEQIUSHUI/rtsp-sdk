@@ -1,0 +1,14 @@
+# ThreadSanitizer suppressions for rtsp-sdk
+#
+# 1. libstdc++ 的 std::ctype<char>::narrow 首次访问会初始化全局缓存，
+#    多个线程同时首次构造 std::regex 会触发"假阳性"。我们把 hot-path
+#    的 regex 改成了 static const，理论上不应再触发；但保留保底抑制。
+race:std::ctype<char>::narrow
+race:std::__detail::_Scanner
+race:std::__detail::_Compiler
+
+# 2. 测试里的 MockRtspServer/MockPublishRtspServer 用 sleep_for 作为"等待
+#    服务线程起来"的粗同步；TSan 不认可 sleep 作为 happens-before。这是
+#    测试方自身的简化做法，不是库 bug。
+race:tests/test_client_rtp_aggregation.cpp
+race:tests/test_integration.cpp
