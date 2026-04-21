@@ -343,12 +343,15 @@ private:
         std::string from_ip;
         uint16_t from_port;
 
+        // 用 poll(200ms) 替代 1ms 忙等，减少嵌入式设备 idle 时的 CPU 占用。
+        // 停止路径通过 shutdownReadWrite + 自发 UDP 包唤醒。
         while (running_) {
+            int r = rtp_socket_.waitReadable(200);
+            if (!running_) break;
+            if (r <= 0) continue;
             ssize_t len = rtp_socket_.recvFrom(buffer, sizeof(buffer), from_ip, from_port);
             if (len > 0) {
                 ingestRtpPacket(buffer, static_cast<size_t>(len));
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
@@ -600,6 +603,9 @@ public:
     uint16_t server_port_ = 554;
     std::string server_path_;
     std::string setup_control_url_;
+    // 来自 DESCRIBE 响应的 Content-Base / Content-Location（RFC2326 / RFC7826 行为）：
+    // 相对 a=control 的解析基准。若 server 未给，则回退到 request_url_。
+    std::string content_base_;
     std::string auth_user_;
     std::string auth_pass_;
     std::string basic_auth_header_;
@@ -680,7 +686,11 @@ public:
         size_t colon_pos = host_port.find(':');
         if (colon_pos != std::string::npos) {
             server_host_ = host_port.substr(0, colon_pos);
-            server_port_ = static_cast<uint16_t>(std::stoi(host_port.substr(colon_pos + 1)));
+            uint32_t p = 0;
+            if (!parseUint32Safe(host_port.substr(colon_pos + 1), p) || p == 0 || p > 65535) {
+                return false;
+            }
+            server_port_ = static_cast<uint16_t>(p);
         } else {
             server_host_ = host_port;
             server_port_ = 554;
@@ -784,23 +794,30 @@ public:
                 session_info_.has_video = true;
                 session_info_.media_streams.emplace_back();
                 current_media = &session_info_.media_streams.back();
-                
+
                 std::istringstream iss(line);
                 std::string type, port, proto, pt;
                 iss >> type >> port >> proto >> pt;
-                current_media->payload_type = std::stoi(pt);
+                uint32_t pt_v = 0;
+                if (parseUint32Safe(pt, pt_v) && pt_v <= 127) {
+                    current_media->payload_type = static_cast<int>(pt_v);
+                }
             } else if (line.rfind("m=", 0) == 0) {
                 // Only parse attributes for the currently active video media section.
                 // When another media section starts (e.g. audio), stop mutating video fields.
                 current_media = nullptr;
             }
             else if (line.find("a=rtpmap:") == 0 && current_media) {
-                std::regex rtpmap_regex("a=rtpmap:(\\d+)\\s+(\\w+)/(\\d+)");
+                // static const 避免每次构造触发 libstdc++ ctype narrow 缓存竞争
+                static const std::regex rtpmap_regex("a=rtpmap:(\\d+)\\s+(\\w+)/(\\d+)");
                 std::smatch match;
                 if (std::regex_search(line, match, rtpmap_regex)) {
                     current_media->codec_name = match[2];
-                    current_media->clock_rate = std::stoi(match[3]);
-                    
+                    uint32_t rate = 0;
+                    if (parseUint32Safe(match[3].str(), rate)) {
+                        current_media->clock_rate = static_cast<int>(rate);
+                    }
+
                     if (current_media->codec_name.find("264") != std::string::npos) {
                         current_media->codec = CodecType::H264;
                     } else if (current_media->codec_name.find("265") != std::string::npos ||
@@ -813,35 +830,46 @@ public:
                 current_media->control_url = line.substr(10);
             }
             else if (line.find("a=framesize:") == 0 && current_media) {
-                std::regex size_regex("a=framesize:(\\d+)\\s+(\\d+)-(\\d+)");
+                static const std::regex size_regex("a=framesize:(\\d+)\\s+(\\d+)-(\\d+)");
                 std::smatch match;
                 if (std::regex_search(line, match, size_regex)) {
-                    current_media->width = std::stoi(match[2]);
-                    current_media->height = std::stoi(match[3]);
+                    uint32_t w = 0, h = 0;
+                    if (parseUint32Safe(match[2].str(), w) &&
+                        parseUint32Safe(match[3].str(), h)) {
+                        current_media->width = w;
+                        current_media->height = h;
+                    }
                 }
             }
             else if (line.find("a=cliprect:") == 0 && current_media) {
-                std::regex clip_regex("a=cliprect:\\d+,\\d+,(\\d+),(\\d+)");
+                static const std::regex clip_regex("a=cliprect:\\d+,\\d+,(\\d+),(\\d+)");
                 std::smatch match;
                 if (std::regex_search(line, match, clip_regex)) {
-                    const uint32_t h = static_cast<uint32_t>(std::stoul(match[1].str()));
-                    const uint32_t w = static_cast<uint32_t>(std::stoul(match[2].str()));
-                    if (w > 0 && h > 0) {
+                    uint32_t h = 0, w = 0;
+                    if (parseUint32Safe(match[1].str(), h) &&
+                        parseUint32Safe(match[2].str(), w) && w > 0 && h > 0) {
                         current_media->width = w;
                         current_media->height = h;
                     }
                 }
             }
             else if (line.find("a=framerate:") == 0 && current_media) {
-                std::regex fr_regex("a=framerate:(\\d+(?:\\.\\d+)?)");
+                static const std::regex fr_regex("a=framerate:(\\d+(?:\\.\\d+)?)");
                 std::smatch match;
                 if (std::regex_search(line, match, fr_regex)) {
-                    current_media->fps = static_cast<uint32_t>(std::stod(match[1]));
+                    try {
+                        double fps_d = std::stod(match[1]);
+                        if (fps_d > 0 && fps_d < 1e6) {
+                            current_media->fps = static_cast<uint32_t>(fps_d);
+                        }
+                    } catch (...) {
+                        // 忽略畸形帧率字符串
+                    }
                 }
             }
             else if (line.find("a=fmtp:") == 0 && current_media) {
                 std::smatch match;
-                std::regex h264_sprop("sprop-parameter-sets=([^;\\s]+)");
+                static const std::regex h264_sprop("sprop-parameter-sets=([^;\\s]+)");
                 if (std::regex_search(line, match, h264_sprop)) {
                     std::string sprops = match[1].str();
                     size_t comma = sprops.find(',');
@@ -850,15 +878,15 @@ public:
                         current_media->pps = base64Decode(sprops.substr(comma + 1));
                     }
                 }
-                std::regex h265_vps("sprop-vps=([^;\\s]+)");
+                static const std::regex h265_vps("sprop-vps=([^;\\s]+)");
                 if (std::regex_search(line, match, h265_vps)) {
                     current_media->vps = base64Decode(match[1].str());
                 }
-                std::regex h265_sps("sprop-sps=([^;\\s]+)");
+                static const std::regex h265_sps("sprop-sps=([^;\\s]+)");
                 if (std::regex_search(line, match, h265_sps)) {
                     current_media->sps = base64Decode(match[1].str());
                 }
-                std::regex h265_pps("sprop-pps=([^;\\s]+)");
+                static const std::regex h265_pps("sprop-pps=([^;\\s]+)");
                 if (std::regex_search(line, match, h265_pps)) {
                     current_media->pps = base64Decode(match[1].str());
                 }
@@ -945,7 +973,7 @@ public:
     }
 
     bool parseWwwAuthenticate(const std::string& response) {
-        std::regex ww_re("WWW-Authenticate:\\s*([^\\r\\n]+)", std::regex::icase);
+        static const std::regex ww_re("WWW-Authenticate:\\s*([^\\r\\n]+)", std::regex::icase);
         std::smatch m;
         if (!std::regex_search(response, m, ww_re)) {
             return false;
@@ -1086,14 +1114,40 @@ bool RtspClient::describe() {
                             "Accept: application/sdp\r\n", "", response)) {
         return false;
     }
-    
+
     if (response.find("200 OK") == std::string::npos) {
         return false;
     }
 
     size_t sdp_start = response.find("\r\n\r\n");
     if (sdp_start == std::string::npos) return false;
-    
+
+    // 解析 Content-Base / Content-Location，用于 SETUP 中拼相对 control URL
+    // 用手写 case-insensitive 搜索而非 std::regex：
+    //  1. 避免 libstdc++ regex 构造器的 std::ctype 内部缓存在 TSan 下误报竞争
+    //  2. 性能更好（每个 DESCRIBE 都要解析）
+    {
+        const std::string headers = response.substr(0, sdp_start);
+        std::string headers_lc;
+        headers_lc.reserve(headers.size());
+        for (char c : headers) headers_lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+        auto extractHeader = [&](const std::string& lc_key) -> std::string {
+            size_t p = headers_lc.find(lc_key);
+            if (p == std::string::npos) return {};
+            p += lc_key.size();
+            while (p < headers.size() && (headers[p] == ' ' || headers[p] == '\t')) ++p;
+            size_t end = headers.find("\r\n", p);
+            if (end == std::string::npos) end = headers.size();
+            std::string v = headers.substr(p, end - p);
+            while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back()))) v.pop_back();
+            return v;
+        };
+        std::string cb = extractHeader("content-base:");
+        if (cb.empty()) cb = extractHeader("content-location:");
+        impl_->content_base_ = cb;
+    }
+
     std::string sdp = response.substr(sdp_start + 4);
     bool ok = impl_->parseSdp(sdp);
     if (ok) {
@@ -1120,10 +1174,40 @@ bool RtspClient::setup(int stream_index) {
     if (stream_index >= (int)impl_->session_info_.media_streams.size()) return false;
 
     auto& media = impl_->session_info_.media_streams[stream_index];
-    
+
+    // control URL 解析优先级：
+    // 1. 绝对 URL（rtsp://...）直接用
+    // 2. control 是 "*" 表示聚合会话，使用 content_base 或 request_url
+    // 3. 相对路径：用 Content-Base（DESCRIBE 响应给的）作为基准；否则用 request_url
+    // 规则对齐 RFC2326/RFC7826，以解决 VLC / 老 live555 在相对 control 上的不一致
     std::string control_url = media.control_url;
-    if (control_url.find("rtsp://") != 0) {
-        control_url = impl_->request_url_ + "/" + control_url;
+    if (control_url == "*") {
+        control_url = !impl_->content_base_.empty() ? impl_->content_base_ : impl_->request_url_;
+    } else if (control_url.find("rtsp://") != 0) {
+        // 相对路径，取 base
+        std::string base = !impl_->content_base_.empty() ? impl_->content_base_ : impl_->request_url_;
+        if (control_url.empty()) {
+            control_url = base;
+        } else if (base.empty()) {
+            control_url = control_url;
+        } else if (control_url.front() == '/') {
+            // control 已以 / 开头，相对 host 基根（罕见）：取 base 的 scheme+host 部分
+            size_t scheme_end = base.find("://");
+            if (scheme_end != std::string::npos) {
+                size_t path_start = base.find('/', scheme_end + 3);
+                std::string origin = (path_start == std::string::npos) ? base : base.substr(0, path_start);
+                control_url = origin + control_url;
+            } else {
+                control_url = base + control_url;
+            }
+        } else {
+            // 纯相对：去掉 base 最末的 / 后（若有），拼 '/' + control
+            if (!base.empty() && base.back() == '/') {
+                control_url = base + control_url;
+            } else {
+                control_url = base + "/" + control_url;
+            }
+        }
     }
     auto do_setup = [&](bool use_tcp, std::string& response_out) -> bool {
         uint16_t selected_rtp_port = 0;
@@ -1191,17 +1275,22 @@ bool RtspClient::setup(int stream_index) {
     if (!ok) return false;
     impl_->use_tcp_transport_ = use_tcp;
 
-    std::regex session_regex("Session:\\s*([^;\\r\\n]+)");
+    static const std::regex session_regex("Session:\\s*([^;\\r\\n]+)");
     std::smatch match;
     if (std::regex_search(response, match, session_regex)) {
         impl_->session_id_ = match[1];
     }
     if (impl_->use_tcp_transport_) {
-        std::regex interleaved_regex("interleaved=(\\d+)-(\\d+)", std::regex::icase);
+        static const std::regex interleaved_regex("interleaved=(\\d+)-(\\d+)", std::regex::icase);
         std::smatch tm;
         if (std::regex_search(response, tm, interleaved_regex)) {
-            impl_->interleaved_rtp_channel_ = static_cast<uint8_t>(std::stoi(tm[1].str()));
-            impl_->interleaved_rtcp_channel_ = static_cast<uint8_t>(std::stoi(tm[2].str()));
+            uint32_t rtp_ch = 0, rtcp_ch = 0;
+            if (parseUint32Safe(tm[1].str(), rtp_ch) && rtp_ch <= 255) {
+                impl_->interleaved_rtp_channel_ = static_cast<uint8_t>(rtp_ch);
+            }
+            if (parseUint32Safe(tm[2].str(), rtcp_ch) && rtcp_ch <= 255) {
+                impl_->interleaved_rtcp_channel_ = static_cast<uint8_t>(rtcp_ch);
+            }
         }
     }
     impl_->rtp_receiver_->setVideoInfo(media.codec, media.width, media.height, media.fps, static_cast<uint8_t>(media.payload_type));

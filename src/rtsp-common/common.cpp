@@ -7,6 +7,8 @@
 #include <iomanip>
 #include <sstream>
 #include <thread>
+#include <limits>
+#include <cctype>
 
 namespace rtsp {
 
@@ -92,6 +94,71 @@ inline uint32_t leftRotate(uint32_t x, uint32_t c) {
 }
 
 } // namespace
+
+namespace {
+
+std::string trimCopy(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+} // namespace
+
+bool parseInt32Safe(const std::string& s, int32_t& out, bool allow_empty) {
+    out = 0;
+    const std::string t = trimCopy(s);
+    if (t.empty()) return allow_empty;
+    try {
+        size_t pos = 0;
+        long long v = std::stoll(t, &pos);
+        if (pos != t.size()) return false;
+        if (v < std::numeric_limits<int32_t>::min() ||
+            v > std::numeric_limits<int32_t>::max()) {
+            return false;
+        }
+        out = static_cast<int32_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parseUint32Safe(const std::string& s, uint32_t& out, bool allow_empty) {
+    out = 0;
+    const std::string t = trimCopy(s);
+    if (t.empty()) return allow_empty;
+    // 不允许负号
+    if (t[0] == '-') return false;
+    try {
+        size_t pos = 0;
+        unsigned long long v = std::stoull(t, &pos);
+        if (pos != t.size()) return false;
+        if (v > std::numeric_limits<uint32_t>::max()) return false;
+        out = static_cast<uint32_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parseUint64Safe(const std::string& s, uint64_t& out, bool allow_empty) {
+    out = 0;
+    const std::string t = trimCopy(s);
+    if (t.empty()) return allow_empty;
+    if (t[0] == '-') return false;
+    try {
+        size_t pos = 0;
+        unsigned long long v = std::stoull(t, &pos);
+        if (pos != t.size()) return false;
+        out = static_cast<uint64_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
 
 std::string md5Hex(const std::string& input) {
     static const uint32_t s[] = {

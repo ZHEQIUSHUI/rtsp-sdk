@@ -82,17 +82,21 @@ public:
 
     bool init(const std::string& local_ip, uint16_t local_port);
     bool setPeer(const std::string& peer_ip, uint16_t peer_rtp_port, uint16_t peer_rtcp_port);
-    
+
+    // 设置本会话 SSRC。必须与对应 RtpPacker::setSsrc 使用同一 SSRC，否则
+    // RTCP Sender Report 与 RTP 流对不上，严格客户端（live555/GStreamer）会忽略或断开。
+    void setSsrc(uint32_t ssrc);
+
     // 发送RTP包
     bool sendRtpPacket(const RtpPacket& packet);
-    
+
     // 批量发送
     bool sendRtpPackets(const std::vector<RtpPacket>& packets);
-    
+
     // 发送RTCP包（简单的Sender Report）
     bool sendSenderReport(uint32_t rtp_timestamp, uint64_t ntp_timestamp,
                           uint32_t packet_count, uint32_t octet_count);
-    
+
     uint16_t getLocalPort() const;
     uint16_t getLocalRtcpPort() const;
 

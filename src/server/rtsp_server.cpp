@@ -20,6 +20,8 @@
 #include <regex>
 #include <unordered_map>
 #include <future>
+#include <random>
+#include <iomanip>
 
 namespace rtsp {
 
@@ -357,12 +359,15 @@ private:
         std::string from_ip;
         uint16_t from_port = 0;
 
+        // socket 为非阻塞（init 里设置），用 waitReadable 200ms 替代 1ms 忙等，
+        // 空闲时几乎零 CPU。停止由 shutdownReadWrite + 自发包唤醒（见 stopWithTimeout）
         while (running_) {
+            int r = rtp_socket_.waitReadable(200);
+            if (!running_) break;
+            if (r <= 0) continue;
             const ssize_t len = rtp_socket_.recvFrom(buffer, sizeof(buffer), from_ip, from_port);
             if (len > 0) {
                 ingestRtpPacket(buffer, static_cast<size_t>(len));
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
@@ -691,20 +696,36 @@ static std::string extractPathFromUrl(const std::string& url) {
     return "/";
 }
 
-// 生成随机session ID
+// 生成随机 session ID / nonce：使用 std::random_device（尽力获取系统熵源）
+// 作为 seed，避免基于时间+计数器的可预测性导致 Digest 鉴权可被预测攻击。
+// 输出 32 hex 字符（128 bits 随机）。
+static std::string generateRandomHex128() {
+    static std::mutex rng_mutex;
+    static std::mt19937_64 rng{[] {
+        std::random_device rd;
+        std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
+        std::mt19937_64 gen;
+        gen.seed(seq);
+        return gen;
+    }()};
+    uint64_t a = 0, b = 0;
+    {
+        std::lock_guard<std::mutex> lock(rng_mutex);
+        a = rng();
+        b = rng();
+    }
+    std::ostringstream oss;
+    oss << std::hex << std::setw(16) << std::setfill('0') << a
+        << std::setw(16) << std::setfill('0') << b;
+    return oss.str();
+}
+
 static std::string generateSessionId() {
-    static std::atomic<uint32_t> counter{0};
-    uint32_t val = counter++;
-    auto now = std::chrono::steady_clock::now();
-    auto ts = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-    
-    std::stringstream ss;
-    ss << std::hex << (ts & 0xFFFFFFFF) << val;
-    return ss.str();
+    return generateRandomHex128();
 }
 
 static std::string generateNonce() {
-    return generateSessionId();
+    return generateRandomHex128();
 }
 
 static std::unordered_map<std::string, std::string> parseAuthParams(const std::string& header_value) {
@@ -852,6 +873,10 @@ struct ClientSession {
             if (rtp_packer && (use_tcp_interleaved || rtp_sender)) {
                 auto packets = rtp_packer->packFrame(frame);
                 
+                // interleaved 模式下，若对端不读导致 send 阻塞，必须有超时——否则
+                // sendLoop 永远卡住，任何 session stop / 服务端 shutdown 都会挂死。
+                constexpr int kInterleavedSendTimeoutMs = 2000;
+                bool send_failed = false;
                 for (const auto& packet : packets) {
                     if (use_tcp_interleaved) {
                         if (control_socket && control_socket->isValid() && control_send_mutex) {
@@ -861,8 +886,19 @@ struct ClientSession {
                             interleaved[2] = static_cast<uint8_t>((packet.size >> 8) & 0xFF);
                             interleaved[3] = static_cast<uint8_t>(packet.size & 0xFF);
                             memcpy(interleaved.data() + 4, packet.data, packet.size);
-                            std::lock_guard<std::mutex> sock_lock(*control_send_mutex);
-                            control_socket->send(interleaved.data(), interleaved.size());
+                            ssize_t sent = 0;
+                            {
+                                std::lock_guard<std::mutex> sock_lock(*control_send_mutex);
+                                sent = control_socket->sendAll(interleaved.data(),
+                                                               interleaved.size(),
+                                                               kInterleavedSendTimeoutMs);
+                            }
+                            if (sent != static_cast<ssize_t>(interleaved.size())) {
+                                RTSP_LOG_WARNING("interleaved send timeout/failed, dropping session send loop");
+                                send_failed = true;
+                                // 关闭 socket 可让 RtspConnection::handle 的 recv 退出进而清理会话
+                                if (control_socket) control_socket->shutdownReadWrite();
+                            }
                         }
                     } else if (rtp_sender) {
                         rtp_sender->sendRtpPacket(packet);
@@ -874,6 +910,17 @@ struct ClientSession {
                         stats->rtp_bytes_sent += packet.size;
                     }
                     delete[] packet.data;
+                    if (send_failed) {
+                        // 释放剩余 packet 内存
+                        continue;
+                    }
+                }
+                if (send_failed) {
+                    // 发送失败：立刻退出 sendLoop，避免继续堆积帧内存
+                    playing = false;
+                    queue_cv.notify_all();
+                    freeVideoFrame(frame);
+                    break;
                 }
                 last_activity_ns.store(steadyNowNs(), std::memory_order_relaxed);
                 
@@ -897,15 +944,25 @@ struct ClientSession {
 // 媒体路径
 struct MediaPath {
     std::string path;
+
+    // config 在 config_mutex 保护下访问：DESCRIBE 读，pushH264Data/pushH265Data
+    // 以及 Publisher 的 RTP 接收回调会写 sps/pps/vps。并发读写 std::vector 是 UB。
+    mutable std::mutex config_mutex;
     PathConfig config;
-    
+
     std::mutex sessions_mutex;
     std::map<std::string, std::shared_ptr<ClientSession>> sessions;
-    
+
     // 最新帧（用于新连接的客户端）
     std::mutex latest_frame_mutex;
     VideoFrame latest_frame;
     bool has_latest_frame = false;
+
+    // 在 config_mutex 下读取配置快照（供 DESCRIBE/SETUP 等只读路径使用）
+    PathConfig snapshotConfig() const {
+        std::lock_guard<std::mutex> lock(config_mutex);
+        return config;
+    }
     
     void broadcastFrame(const VideoFrame& frame) {
         // 更新最新帧
@@ -927,13 +984,24 @@ struct MediaPath {
     }
     
     void addSession(const std::string& session_id, std::shared_ptr<ClientSession> session) {
-        std::lock_guard<std::mutex> lock(sessions_mutex);
-        sessions[session_id] = session;
-        
-        // 发送最新帧给新客户端（关键帧优先）
-        std::lock_guard<std::mutex> lf_lock(latest_frame_mutex);
-        if (has_latest_frame && latest_frame.type == FrameType::IDR) {
-            session->pushFrame(latest_frame);
+        // 避免锁序倒置：broadcastFrame 顺序为 latest_frame_mutex -> sessions_mutex，
+        // 此处先在 latest_frame_mutex 下克隆帧到本地变量，释放后再拿 sessions_mutex。
+        VideoFrame cached_idr{};
+        bool has_cached_idr = false;
+        {
+            std::lock_guard<std::mutex> lf_lock(latest_frame_mutex);
+            if (has_latest_frame && latest_frame.type == FrameType::IDR) {
+                cached_idr = cloneFrameManaged(latest_frame);
+                has_cached_idr = true;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            sessions[session_id] = session;
+        }
+        if (has_cached_idr) {
+            session->pushFrame(cached_idr);
+            freeVideoFrame(cached_idr);
         }
     }
     
@@ -980,14 +1048,25 @@ public:
           digest_nonce_created_(std::chrono::steady_clock::now()) {}
     
     void handle() {
+        // 请求/累积缓冲上限（防 slowloris 和恶意 Content-Length 耗尽内存）：
+        // 单个 RTSP header 最多 32KB，单个 body 最多 64KB（RTSP 控制层不需要大 body），
+        // 累积缓冲区最多 192KB（够容纳最大 header+body+一个 interleaved 包）。
+        constexpr size_t kMaxRtspHeader = 32 * 1024;
+        constexpr size_t kMaxRtspBody = 64 * 1024;
+        constexpr size_t kMaxBufferTotal = 192 * 1024;
+
         std::string buffer;
         buffer.reserve(4096);
-        
+
         uint8_t temp[4096];
         while (socket_->isValid()) {
             ssize_t n = socket_->recv(temp, sizeof(temp), 1000);
             if (n > 0) {
                 buffer.append((char*)temp, n);
+                if (buffer.size() > kMaxBufferTotal) {
+                    RTSP_LOG_WARNING("RTSP buffer exceeded limit, closing connection");
+                    break;
+                }
 
                 // TCP interleaved mode: the client may send interleaved RTP/RTCP packets (start with '$')
                 // on the control socket. If we try to parse these bytes as RTSP text, we may emit bogus
@@ -1016,10 +1095,23 @@ public:
                     // 检查是否收到完整请求
                     const size_t pos = buffer.find("\r\n\r\n");
                     if (pos == std::string::npos) {
+                        // 未找到 header 结束，检查是否已超过 header 上限（slowloris 防护）
+                        if (buffer.size() > kMaxRtspHeader) {
+                            RTSP_LOG_WARNING("RTSP header exceeded limit, closing connection");
+                            buffer.clear();
+                            socket_->shutdownReadWrite();
+                        }
                         break;
                     }
+                    const size_t header_end = pos + 4;
+                    if (header_end > kMaxRtspHeader) {
+                        RTSP_LOG_WARNING("RTSP header too large, closing connection");
+                        buffer.clear();
+                        socket_->shutdownReadWrite();
+                        break;
+                    }
+
                     size_t content_length = 0;
-                    size_t header_end = pos + 4;
 
                     // 解析Content-Length
                     std::string header = buffer.substr(0, header_end);
@@ -1030,13 +1122,20 @@ public:
                         size_t cl_end = header_lower.find("\r\n", cl_pos);
                         if (cl_end != std::string::npos) {
                             std::string cl_str = header.substr(cl_pos + 15, cl_end - cl_pos - 15);
-                            try {
-                                content_length = static_cast<size_t>(std::stoul(cl_str));
-                            } catch (...) {
-                                // 非法Content-Length，丢弃当前缓冲避免崩溃
+                            uint64_t cl_val = 0;
+                            if (!parseUint64Safe(cl_str, cl_val)) {
+                                RTSP_LOG_WARNING("RTSP invalid Content-Length, closing connection");
                                 buffer.clear();
+                                socket_->shutdownReadWrite();
                                 break;
                             }
+                            if (cl_val > kMaxRtspBody) {
+                                RTSP_LOG_WARNING("RTSP Content-Length too large, closing connection");
+                                buffer.clear();
+                                socket_->shutdownReadWrite();
+                                break;
+                            }
+                            content_length = static_cast<size_t>(cl_val);
                         }
                     }
 
@@ -1058,11 +1157,18 @@ public:
             // n < 0 是超时，继续循环
         }
         
-        // 清理会话
+        // 清理会话：paths_ 访问必须在 paths_mutex_ 下，避免与 addPath/removePath 竞争
         if (session_) {
-            auto path_it = paths_.find(session_->path);
-            if (path_it != paths_.end()) {
-                path_it->second->removeSession(session_->session_id);
+            std::shared_ptr<MediaPath> media_path;
+            {
+                std::lock_guard<std::mutex> lock(paths_mutex_);
+                auto path_it = paths_.find(session_->path);
+                if (path_it != paths_.end()) {
+                    media_path = path_it->second;
+                }
+            }
+            if (media_path) {
+                media_path->removeSession(session_->session_id);
             }
             if (disconnect_cb_ && session_->role == SessionRole::Player) {
                 disconnect_cb_(session_->path, session_->client_ip);
@@ -1147,8 +1253,10 @@ private:
         }
         
         auto& media_path = it->second;
-        auto& config = media_path->config;
-        
+        // 在 config_mutex 下取一份快照，之后对 SDP 构建都基于这份不变快照，
+        // 避免与 Publisher 的 RTP 接收回调 / pushH26xData 的写入竞争。
+        const PathConfig config = media_path->snapshotConfig();
+
         // 构建SDP
         SdpBuilder sdp;
         // Use the actual local IP address of the RTSP control connection to maximize client compatibility.
@@ -1185,8 +1293,22 @@ private:
             sdp.addH265Media(control, 0, payload_type, clock_rate,
                             vps_b64, sps_b64, pps_b64, config.width, config.height);
         }
-        
-        sendResponse(RtspResponse::createDescribe(cseq, sdp.build()));
+
+        // 构造 DESCRIBE 响应，附带 Content-Base 头让不同客户端对相对 control URL
+        // 的解析基准一致（VLC / 老 live555 / GStreamer 行为本来发散）。
+        // Content-Base 以 '/' 结尾，确保 "stream" 拼接结果稳定。
+        RtspResponse resp = RtspResponse::createDescribe(cseq, sdp.build());
+        {
+            std::string content_base = request.getUri();
+            // 去掉查询串
+            auto q = content_base.find('?');
+            if (q != std::string::npos) content_base = content_base.substr(0, q);
+            if (content_base.empty()) content_base = request.getPath();
+            if (content_base.empty()) content_base = "rtsp://";
+            if (content_base.back() != '/') content_base.push_back('/');
+            resp.setHeader("Content-Base", content_base);
+        }
+        sendResponse(resp);
     }
 
     void handleAnnounce(const RtspRequest& request, int cseq) {
@@ -1205,26 +1327,35 @@ private:
         }
 
         {
-            std::lock_guard<std::mutex> lock(paths_mutex_);
-            auto it = paths_.find(path);
-            if (it == paths_.end()) {
-                auto media_path = std::make_shared<MediaPath>();
-                media_path->path = path;
-                media_path->config = announced_config;
-                paths_[path] = media_path;
-            } else {
-                it->second->config.codec = announced_config.codec;
-                it->second->config.width = announced_config.width;
-                it->second->config.height = announced_config.height;
-                it->second->config.fps = announced_config.fps;
+            std::shared_ptr<MediaPath> media_path;
+            {
+                std::lock_guard<std::mutex> lock(paths_mutex_);
+                auto it = paths_.find(path);
+                if (it == paths_.end()) {
+                    media_path = std::make_shared<MediaPath>();
+                    media_path->path = path;
+                    // 新路径此时只有当前线程持有引用，无需加 config_mutex
+                    media_path->config = announced_config;
+                    paths_[path] = media_path;
+                } else {
+                    media_path = it->second;
+                }
+            }
+            // 已存在的路径需要在 config_mutex 下更新，避免与 DESCRIBE 读冲突
+            if (media_path) {
+                std::lock_guard<std::mutex> cfg_lock(media_path->config_mutex);
+                media_path->config.codec = announced_config.codec;
+                media_path->config.width = announced_config.width;
+                media_path->config.height = announced_config.height;
+                media_path->config.fps = announced_config.fps;
                 if (!announced_config.sps.empty()) {
-                    it->second->config.sps = announced_config.sps;
+                    media_path->config.sps = announced_config.sps;
                 }
                 if (!announced_config.pps.empty()) {
-                    it->second->config.pps = announced_config.pps;
+                    media_path->config.pps = announced_config.pps;
                 }
                 if (!announced_config.vps.empty()) {
-                    it->second->config.vps = announced_config.vps;
+                    media_path->config.vps = announced_config.vps;
                 }
             }
         }
@@ -1311,14 +1442,25 @@ private:
                                            session_->client_rtcp_port);
         }
         
-        // 创建RTP打包器
-        if (media_path->config.codec == CodecType::H264) {
+        // 创建RTP打包器（读 codec 需要在 config_mutex 下做，避免与 auto-extract 竞争）
+        CodecType path_codec;
+        {
+            std::lock_guard<std::mutex> cfg_lock(media_path->config_mutex);
+            path_codec = media_path->config.codec;
+        }
+        if (path_codec == CodecType::H264) {
             session_->rtp_packer = std::make_unique<H264RtpPacker>();
         } else {
             session_->rtp_packer = std::make_unique<H265RtpPacker>();
         }
-        session_->rtp_packer->setPayloadType((media_path->config.codec == CodecType::H264) ? 96 : 97);
-        session_->rtp_packer->setSsrc(0x12345678 + std::hash<std::string>{}(session_->session_id));
+        session_->rtp_packer->setPayloadType((path_codec == CodecType::H264) ? 96 : 97);
+        const uint32_t session_ssrc = static_cast<uint32_t>(
+            0x12345678u + std::hash<std::string>{}(session_->session_id));
+        session_->rtp_packer->setSsrc(session_ssrc);
+        // RTCP Sender Report 必须携带同一 SSRC
+        if (session_->rtp_sender) {
+            session_->rtp_sender->setSsrc(session_ssrc);
+        }
         
         // 添加到媒体路径
         media_path->addSession(session_->session_id, session_);
@@ -1327,19 +1469,20 @@ private:
             connect_cb_(session_->path, session_->client_ip);
         }
         
-        // 重新计算 use_tcp（因为前面代码块中的变量作用域问题）
-        bool is_tcp = use_tcp;
-        if (is_tcp) {
-            std::regex ch_re("interleaved=(\\d+)-(\\d+)", std::regex::icase);
+        if (use_tcp) {
+            static const std::regex ch_re("interleaved=(\\d+)-(\\d+)", std::regex::icase);
             std::smatch m;
             if (std::regex_search(transport, m, ch_re)) {
-                session_->interleaved_rtp_channel = static_cast<uint8_t>(std::stoi(m[1].str()));
+                uint32_t ch = 0;
+                if (parseUint32Safe(m[1].str(), ch) && ch <= 255) {
+                    session_->interleaved_rtp_channel = static_cast<uint8_t>(ch);
+                }
             }
         }
         
         // 构建transport响应
         std::stringstream transport_ss;
-        if (is_tcp) {
+        if (use_tcp) {
             // TCP 模式 (RTP over RTSP)
             transport_ss << "RTP/AVP/TCP;unicast;interleaved="
                          << static_cast<int>(session_->interleaved_rtp_channel) << "-"
@@ -1404,22 +1547,29 @@ private:
                 return;
             }
 
-            receiver->setVideoInfo(media_path->config.codec,
-                                   media_path->config.width,
-                                   media_path->config.height,
-                                   media_path->config.fps,
-                                   session_->publisher_payload_type);
+            {
+                std::lock_guard<std::mutex> cfg_lock(media_path->config_mutex);
+                receiver->setVideoInfo(media_path->config.codec,
+                                       media_path->config.width,
+                                       media_path->config.height,
+                                       media_path->config.fps,
+                                       session_->publisher_payload_type);
+            }
             std::weak_ptr<MediaPath> weak_path = media_path;
             std::weak_ptr<ClientSession> weak_session = session_;
             receiver->setCallback([weak_path, weak_session, this](const VideoFrame& frame) {
                 if (auto path = weak_path.lock()) {
-                    if (frame.codec == CodecType::H264 &&
-                        (frame.type == FrameType::IDR || path->config.sps.empty() || path->config.pps.empty())) {
-                        (void)autoExtractH264ParameterSets(path->config, frame.data, frame.size);
-                    } else if (frame.codec == CodecType::H265 &&
-                               (frame.type == FrameType::IDR || path->config.vps.empty() ||
-                                path->config.sps.empty() || path->config.pps.empty())) {
-                        (void)autoExtractH265ParameterSets(path->config, frame.data, frame.size);
+                    // 在 config_mutex 下做 auto-extract，与 DESCRIBE 的读侧互斥
+                    {
+                        std::lock_guard<std::mutex> cfg_lock(path->config_mutex);
+                        if (frame.codec == CodecType::H264 &&
+                            (frame.type == FrameType::IDR || path->config.sps.empty() || path->config.pps.empty())) {
+                            (void)autoExtractH264ParameterSets(path->config, frame.data, frame.size);
+                        } else if (frame.codec == CodecType::H265 &&
+                                   (frame.type == FrameType::IDR || path->config.vps.empty() ||
+                                    path->config.sps.empty() || path->config.pps.empty())) {
+                            (void)autoExtractH265ParameterSets(path->config, frame.data, frame.size);
+                        }
                     }
                     path->broadcastFrame(frame);
                     stats_.frames_pushed++;
@@ -1553,8 +1703,15 @@ private:
     
     void sendResponse(const RtspResponse& response) {
         std::string data = response.build();
+        // 带超时的响应写，防止客户端停止读取时阻塞连接线程
+        constexpr int kRtspRespSendTimeoutMs = 2000;
         std::lock_guard<std::mutex> lock(*send_mutex_);
-        socket_->send((const uint8_t*)data.c_str(), data.size());
+        ssize_t sent = socket_->sendAll(reinterpret_cast<const uint8_t*>(data.data()),
+                                        data.size(), kRtspRespSendTimeoutMs);
+        if (sent != static_cast<ssize_t>(data.size())) {
+            RTSP_LOG_WARNING("RTSP response send timeout/failed, closing connection");
+            socket_->shutdownReadWrite();
+        }
     }
 
     bool checkAuthorization(const RtspRequest& request, int cseq) {
@@ -1730,7 +1887,11 @@ public:
 
             cleanupFinishedConnections();
             
-            // 清理超时会话
+            // 清理超时会话：先在锁下收集过期的 shared_ptr 与断连信息，
+            // 再完全脱离 paths_mutex_/sessions_mutex 之后调用 session->stop()。
+            // 这样即使 stop() 里 join 的发送线程被 TCP 对端阻塞，也不会占着大锁
+            // 导致其他请求、推流、清理全部挂死。
+            std::vector<std::shared_ptr<ClientSession>> expired_sessions;
             std::vector<std::pair<std::string, std::string>> disconnects;
             {
                 std::lock_guard<std::mutex> lock(paths_mutex_);
@@ -1746,7 +1907,7 @@ public:
                             it->second->last_activity_ns.load(std::memory_order_relaxed);
                         if (last_activity_ns != 0 && now_ns - last_activity_ns > timeout_ns) {
                             RTSP_LOG_INFO("Session timeout: " + it->first);
-                            it->second->stop();
+                            expired_sessions.push_back(it->second);
                             stats_.sessions_closed++;
                             if (it->second->role == SessionRole::Player) {
                                 disconnects.emplace_back(path->path, it->second->client_ip);
@@ -1757,6 +1918,10 @@ public:
                         }
                     }
                 }
+            }
+            // 锁外 stop（join 发送线程），即使 send 被阻塞也不会牵连全局
+            for (auto& session : expired_sessions) {
+                session->stop();
             }
             for (const auto& d : disconnects) {
                 if (disconnect_callback_) {
@@ -1770,9 +1935,22 @@ public:
 };
 
 uint16_t RtspServerConfig::getNextRtpPort(uint32_t& current, uint32_t start, uint32_t end) {
-    uint16_t port = (uint16_t)current;
+    // 用全局 mutex 序列化并发 SETUP 的端口分配，避免两路会话拿到同一对端口。
+    // 端口池本身是系统全局资源，全局锁是合适粒度。
+    static std::mutex port_allocation_mutex;
+    std::lock_guard<std::mutex> lock(port_allocation_mutex);
+    if (start >= end) {
+        // 非法区间，退化为 current 原值并自增以便调用方 bind 失败后进入重试路径
+        uint16_t port = static_cast<uint16_t>(current);
+        current += 2;
+        return port;
+    }
+    if (current < start || current + 1 >= end) {
+        current = start;
+    }
+    uint16_t port = static_cast<uint16_t>(current);
     current += 2;
-    if (current >= end) {
+    if (current + 1 >= end) {
         current = start;
     }
     return port;
@@ -1855,7 +2033,10 @@ bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
         std::lock_guard<std::mutex> lock(impl_->connections_mutex_);
         for (auto& c : impl_->connections_) {
             if (c.socket) {
-                c.socket->close();
+                // 先 shutdown 让连接线程里阻塞中的 recv 立刻返回；close 留给连接
+                // 线程自己执行。这样避免"主线程 close(fd) 同时另一线程还在 recv(fd)"
+                // 的 fd 并发使用（TSan 会判为数据竞争，OS 层虽安全但不干净）。
+                c.socket->shutdownReadWrite();
             }
         }
         connections = std::move(impl_->connections_);
@@ -1931,14 +2112,18 @@ bool RtspServer::removePath(const std::string& path) {
 }
 
 bool RtspServer::pushFrame(const std::string& path, const VideoFrame& frame) {
-    std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
-    
-    auto it = impl_->paths_.find(path);
-    if (it == impl_->paths_.end()) {
-        return false;
+    // 在 paths_mutex_ 下仅取 shared_ptr，随后释放锁再广播，避免大锁阻塞 SETUP/DESCRIBE
+    std::shared_ptr<MediaPath> media_path;
+    {
+        std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
+        auto it = impl_->paths_.find(path);
+        if (it == impl_->paths_.end()) {
+            return false;
+        }
+        media_path = it->second;
     }
-    
-    it->second->broadcastFrame(frame);
+
+    media_path->broadcastFrame(frame);
     impl_->stats_.frames_pushed++;
     return true;
 }
@@ -1952,22 +2137,29 @@ bool RtspServer::pushH264Data(const std::string& path, const uint8_t* data, size
     frame.size = size;
     frame.pts = pts;
     frame.dts = pts;
-    
-    std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
-    auto it = impl_->paths_.find(path);
-    if (it == impl_->paths_.end()) {
-        return false;
-    }
 
+    std::shared_ptr<MediaPath> media_path;
+    {
+        std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
+        auto it = impl_->paths_.find(path);
+        if (it == impl_->paths_.end()) {
+            return false;
+        }
+        media_path = it->second;
+    }
+    // 锁外：auto-extract + 广播（config_mutex 保护 config 读写）
     bool updated = false;
-    if (is_key || it->second->config.sps.empty() || it->second->config.pps.empty()) {
-        updated = autoExtractH264ParameterSets(it->second->config, data, size);
+    {
+        std::lock_guard<std::mutex> cfg_lock(media_path->config_mutex);
+        if (is_key || media_path->config.sps.empty() || media_path->config.pps.empty()) {
+            updated = autoExtractH264ParameterSets(media_path->config, data, size);
+        }
     }
     if (updated) {
         RTSP_LOG_INFO("Auto-updated H264 parameter sets for path: " + path);
     }
 
-    it->second->broadcastFrame(frame);
+    media_path->broadcastFrame(frame);
     impl_->stats_.frames_pushed++;
     return true;
 }
@@ -1981,44 +2173,57 @@ bool RtspServer::pushH265Data(const std::string& path, const uint8_t* data, size
     frame.size = size;
     frame.pts = pts;
     frame.dts = pts;
-    
-    std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
-    auto it = impl_->paths_.find(path);
-    if (it == impl_->paths_.end()) {
-        return false;
+
+    std::shared_ptr<MediaPath> media_path;
+    {
+        std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
+        auto it = impl_->paths_.find(path);
+        if (it == impl_->paths_.end()) {
+            return false;
+        }
+        media_path = it->second;
     }
 
     bool updated = false;
-    if (is_key || it->second->config.vps.empty() || it->second->config.sps.empty() || it->second->config.pps.empty()) {
-        updated = autoExtractH265ParameterSets(it->second->config, data, size);
+    {
+        std::lock_guard<std::mutex> cfg_lock(media_path->config_mutex);
+        if (is_key || media_path->config.vps.empty() || media_path->config.sps.empty() || media_path->config.pps.empty()) {
+            updated = autoExtractH265ParameterSets(media_path->config, data, size);
+        }
     }
     if (updated) {
         RTSP_LOG_INFO("Auto-updated H265 parameter sets for path: " + path);
     }
 
-    it->second->broadcastFrame(frame);
+    media_path->broadcastFrame(frame);
     impl_->stats_.frames_pushed++;
     return true;
 }
 
 std::shared_ptr<IVideoFrameInput> RtspServer::getFrameInput(const std::string& path) {
+    // 捕获 MediaPath 的 weak_ptr，避免把裸 Impl* 暴露给外部导致 Server 析构后 UAF。
+    std::weak_ptr<MediaPath> weak_path;
+    {
+        std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
+        auto it = impl_->paths_.find(path);
+        if (it != impl_->paths_.end()) {
+            weak_path = it->second;
+        }
+    }
+
     class FrameInput : public IVideoFrameInput {
     public:
-        FrameInput(RtspServer::Impl* impl, std::string p) : impl_(impl), path_(std::move(p)) {}
+        explicit FrameInput(std::weak_ptr<MediaPath> wp) : weak_path_(std::move(wp)) {}
         bool pushFrame(const VideoFrame& frame) override {
-            std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
-            auto it = impl_->paths_.find(path_);
-            if (it == impl_->paths_.end()) {
-                return false;
-            }
-            it->second->broadcastFrame(frame);
+            auto path = weak_path_.lock();
+            if (!path) return false;
+            path->broadcastFrame(frame);
             return true;
         }
     private:
-        RtspServer::Impl* impl_;
-        std::string path_;
+        std::weak_ptr<MediaPath> weak_path_;
     };
-    return std::make_shared<FrameInput>(impl_.get(), path);
+    return std::make_shared<FrameInput>(weak_path);
 }
 
 void RtspServer::setClientConnectCallback(ClientConnectCallback callback) {

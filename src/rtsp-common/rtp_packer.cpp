@@ -495,6 +495,7 @@ public:
     std::string peer_ip_;
     uint16_t peer_rtp_port_ = 0;
     uint16_t peer_rtcp_port_ = 0;
+    uint32_t ssrc_ = 0x12345678;   // 默认值；应通过 setSsrc 与 RtpPacker 保持一致
 };
 
 RtpSender::RtpSender() : impl_(std::make_unique<Impl>()) {}
@@ -526,6 +527,13 @@ bool RtpSender::setPeer(const std::string& peer_ip, uint16_t peer_rtp_port, uint
     impl_->peer_rtp_port_ = peer_rtp_port;
     impl_->peer_rtcp_port_ = peer_rtcp_port;
     return true;
+}
+
+void RtpSender::setSsrc(uint32_t ssrc) {
+    if (!impl_) {
+        return;
+    }
+    impl_->ssrc_ = ssrc;
 }
 
 bool RtpSender::sendRtpPacket(const RtpPacket& packet) {
@@ -561,8 +569,8 @@ bool RtpSender::sendSenderReport(uint32_t rtp_timestamp, uint64_t ntp_timestamp,
     sr[2] = 0;     // length (in 32-bit words minus one)
     sr[3] = 12;    // = 52/4 - 1 = 12
     
-    // SSRC (使用固定值，实际应该存储会话的SSRC)
-    uint32_t ssrc = 0x12345678;
+    // SSRC 与本会话 RTP 流一致（通过 setSsrc 配置），否则严格客户端会忽略 SR
+    const uint32_t ssrc = impl_->ssrc_;
     sr[4] = (ssrc >> 24) & 0xFF;
     sr[5] = (ssrc >> 16) & 0xFF;
     sr[6] = (ssrc >> 8) & 0xFF;
