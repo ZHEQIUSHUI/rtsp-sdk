@@ -2111,6 +2111,18 @@ bool RtspServer::removePath(const std::string& path) {
     return impl_->paths_.erase(path) > 0;
 }
 
+std::vector<PathConfig> RtspServer::getPathsSnapshot() const {
+    std::vector<PathConfig> out;
+    std::lock_guard<std::mutex> lock(impl_->paths_mutex_);
+    out.reserve(impl_->paths_.size());
+    for (const auto& kv : impl_->paths_) {
+        // 每个 MediaPath 的 config 还有自己的 config_mutex 保护 sps/pps/vps。
+        std::lock_guard<std::mutex> cfg_lock(kv.second->config_mutex);
+        out.push_back(kv.second->config);
+    }
+    return out;
+}
+
 bool RtspServer::pushFrame(const std::string& path, const VideoFrame& frame) {
     // 在 paths_mutex_ 下仅取 shared_ptr，随后释放锁再广播，避免大锁阻塞 SETUP/DESCRIBE
     std::shared_ptr<MediaPath> media_path;
