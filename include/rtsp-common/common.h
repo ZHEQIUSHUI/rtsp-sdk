@@ -90,6 +90,14 @@ std::string base64Encode(const uint8_t* data, size_t size);
 std::vector<uint8_t> base64Decode(const std::string& str);
 std::string md5Hex(const std::string& data);
 
+// 安全整数解析：失败时返回 false 并将 out 置为 0。
+// 用于所有来自网络的字段（CSeq/端口/payload_type 等），避免 std::stoi 抛异常
+// 时穿透连接处理线程、让恶意/畸形输入造成 DoS 式崩溃。
+// allow_empty=false 时空字符串视为解析失败。
+bool parseInt32Safe(const std::string& s, int32_t& out, bool allow_empty = false);
+bool parseUint32Safe(const std::string& s, uint32_t& out, bool allow_empty = false);
+bool parseUint64Safe(const std::string& s, uint64_t& out, bool allow_empty = false);
+
 // 日志级别
 enum class LogLevel {
     Debug,

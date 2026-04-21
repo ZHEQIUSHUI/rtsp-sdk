@@ -39,14 +39,25 @@ public:
 
     // 通用
     ssize_t send(const uint8_t* data, size_t size);
+    // 带超时的全量发送：在 timeout_ms 内尽量发完 size 字节，
+    // 返回已发送字节数；timeout 命中或 socket 关闭返回 -1。
+    // 避免 TCP 对端不读时阻塞主调用链（RTSP interleaved 模式下必需）。
+    ssize_t sendAll(const uint8_t* data, size_t size, int timeout_ms);
     ssize_t recv(uint8_t* buffer, size_t size, int timeout_ms = -1);
-    
+
     void close();
     bool shutdownReadWrite();
     bool setNonBlocking(bool non_blocking);
     bool setReuseAddr(bool reuse);
     bool setSendBufferSize(int size);
     bool setRecvBufferSize(int size);
+    // 启用 Nagle 禁用（适用于 TCP）。非 TCP socket 忽略。
+    bool setTcpNoDelay(bool enable);
+    // 设置内核级发送超时（SO_SNDTIMEO）。对于阻塞 send 保护底线。
+    bool setSendTimeout(int timeout_ms);
+    // poll socket 可读；timeout_ms=0 立即返回；>0 最多等这么久。
+    // 返回值：1 可读，0 超时，-1 错误或已关闭。用于替代非阻塞 recvFrom 的 1ms 忙等。
+    int waitReadable(int timeout_ms) const;
     
     bool isValid() const;
     int getFd() const;
@@ -82,6 +93,11 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// 工具：从 TCP socket 读取一条完整的 RTSP 消息（status/request line + headers + optional body
+// by Content-Length），忽略之后可能 pipeline 过来的额外字节。
+// 超时或对端关闭返回 false。公共实现供 client/publisher 复用，避免单次 recv 的脆弱路径。
+bool recvRtspMessage(Socket& socket, std::string* out, int timeout_ms);
 
 // TCP服务器
 class TcpServer {

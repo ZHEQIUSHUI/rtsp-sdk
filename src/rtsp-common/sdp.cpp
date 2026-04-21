@@ -191,10 +191,13 @@ bool SdpParser::parse(const std::string& sdp) {
             media_infos_.emplace_back();
             current_media = &media_infos_.back();
 
-            std::regex media_regex(R"(m=video\s+\d+\s+\S+\s+(\d+))", std::regex::icase);
+            static const std::regex media_regex(R"(m=video\s+\d+\s+\S+\s+(\d+))", std::regex::icase);
             std::smatch match;
             if (std::regex_search(line, match, media_regex)) {
-                current_media->payload_type = static_cast<uint8_t>(std::stoi(match[1].str()));
+                uint32_t v = 0;
+                if (parseUint32Safe(match[1].str(), v) && v <= 127) {
+                    current_media->payload_type = static_cast<uint8_t>(v);
+                }
             }
             continue;
         }
@@ -204,12 +207,16 @@ bool SdpParser::parse(const std::string& sdp) {
         }
 
         if (line.rfind("a=rtpmap:", 0) == 0) {
-            std::regex rtpmap_regex(R"(a=rtpmap:(\d+)\s+([A-Za-z0-9_-]+)/(\d+))", std::regex::icase);
+            static const std::regex rtpmap_regex(R"(a=rtpmap:(\d+)\s+([A-Za-z0-9_-]+)/(\d+))", std::regex::icase);
             std::smatch match;
             if (std::regex_search(line, match, rtpmap_regex)) {
-                current_media->payload_type = static_cast<uint8_t>(std::stoi(match[1].str()));
+                uint32_t pt = 0;
+                uint32_t rate = 0;
+                if (!parseUint32Safe(match[1].str(), pt) || pt > 127) continue;
+                if (!parseUint32Safe(match[3].str(), rate)) continue;
+                current_media->payload_type = static_cast<uint8_t>(pt);
                 current_media->payload_name = match[2].str();
-                current_media->clock_rate = static_cast<uint32_t>(std::stoul(match[3].str()));
+                current_media->clock_rate = rate;
 
                 std::string codec_name = current_media->payload_name;
                 for (char& ch : codec_name) {
@@ -223,42 +230,50 @@ bool SdpParser::parse(const std::string& sdp) {
                 }
             }
         } else if (line.rfind("a=framesize:", 0) == 0) {
-            std::regex size_regex(R"(a=framesize:\d+\s+(\d+)-(\d+))", std::regex::icase);
+            static const std::regex size_regex(R"(a=framesize:\d+\s+(\d+)-(\d+))", std::regex::icase);
             std::smatch match;
             if (std::regex_search(line, match, size_regex)) {
-                current_media->width = static_cast<uint32_t>(std::stoul(match[1].str()));
-                current_media->height = static_cast<uint32_t>(std::stoul(match[2].str()));
+                uint32_t w = 0, h = 0;
+                if (parseUint32Safe(match[1].str(), w) && parseUint32Safe(match[2].str(), h)) {
+                    current_media->width = w;
+                    current_media->height = h;
+                }
             }
         } else if (line.rfind("a=cliprect:", 0) == 0) {
-            std::regex clip_regex(R"(a=cliprect:\d+,\d+,(\d+),(\d+))", std::regex::icase);
+            static const std::regex clip_regex(R"(a=cliprect:\d+,\d+,(\d+),(\d+))", std::regex::icase);
             std::smatch match;
             if (std::regex_search(line, match, clip_regex)) {
-                const uint32_t height = static_cast<uint32_t>(std::stoul(match[1].str()));
-                const uint32_t width = static_cast<uint32_t>(std::stoul(match[2].str()));
-                if (current_media->width == 0) {
-                    current_media->width = width;
-                }
-                if (current_media->height == 0) {
-                    current_media->height = height;
+                uint32_t height = 0, width = 0;
+                if (parseUint32Safe(match[1].str(), height) && parseUint32Safe(match[2].str(), width)) {
+                    if (current_media->width == 0)  current_media->width  = width;
+                    if (current_media->height == 0) current_media->height = height;
                 }
             }
         } else if (line.rfind("a=framerate:", 0) == 0) {
-            std::regex framerate_regex(R"(a=framerate:(\d+(?:\.\d+)?))", std::regex::icase);
+            static const std::regex framerate_regex(R"(a=framerate:(\d+(?:\.\d+)?))", std::regex::icase);
             std::smatch match;
             if (std::regex_search(line, match, framerate_regex)) {
-                current_media->fps = static_cast<uint32_t>(std::stod(match[1].str()));
+                // framerate 可能是小数，先用 stod 但包 try；失败保持 0
+                try {
+                    double fps_d = std::stod(match[1].str());
+                    if (fps_d > 0 && fps_d < 1e6) {
+                        current_media->fps = static_cast<uint32_t>(fps_d);
+                    }
+                } catch (...) {
+                    // 忽略畸形帧率
+                }
             }
         } else if (line.rfind("a=fmtp:", 0) == 0) {
-            std::regex h264_regex(R"(sprop-parameter-sets=([^,;\s]+),([^;\s]+))", std::regex::icase);
+            static const std::regex h264_regex(R"(sprop-parameter-sets=([^,;\s]+),([^;\s]+))", std::regex::icase);
             std::smatch h264_match;
             if (std::regex_search(line, h264_match, h264_regex)) {
                 current_media->sps = h264_match[1].str();
                 current_media->pps = h264_match[2].str();
             }
 
-            std::regex h265_vps_regex(R"(sprop-vps=([^;\s]+))", std::regex::icase);
-            std::regex h265_sps_regex(R"(sprop-sps=([^;\s]+))", std::regex::icase);
-            std::regex h265_pps_regex(R"(sprop-pps=([^;\s]+))", std::regex::icase);
+            static const std::regex h265_vps_regex(R"(sprop-vps=([^;\s]+))", std::regex::icase);
+            static const std::regex h265_sps_regex(R"(sprop-sps=([^;\s]+))", std::regex::icase);
+            static const std::regex h265_pps_regex(R"(sprop-pps=([^;\s]+))", std::regex::icase);
             std::smatch match;
             if (std::regex_search(line, match, h265_vps_regex)) {
                 current_media->vps = match[1].str();

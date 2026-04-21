@@ -1,4 +1,5 @@
 #include <rtsp-common/rtsp_request.h>
+#include <rtsp-common/common.h>
 #include <algorithm>
 #include <cctype>
 #include <sstream>
@@ -101,7 +102,8 @@ bool RtspRequest::parse(const char* data, size_t len) {
 int RtspRequest::getCSeq() const {
     auto it = headers_.find("cseq");
     if (it != headers_.end()) {
-        return std::stoi(it->second);
+        int32_t v = 0;
+        if (parseInt32Safe(it->second, v)) return v;
     }
     return -1;
 }
@@ -144,20 +146,22 @@ std::string RtspRequest::getSession() const {
 
 int RtspRequest::getRtpPort() const {
     std::string transport = getTransport();
-    std::regex client_port_regex("client_port=(\\d+)");
+    static const std::regex client_port_regex("client_port=(\\d+)");
     std::smatch match;
     if (std::regex_search(transport, match, client_port_regex)) {
-        return std::stoi(match[1]);
+        int32_t v = 0;
+        if (parseInt32Safe(match[1].str(), v) && v >= 0 && v <= 65535) return v;
     }
     return 0;
 }
 
 int RtspRequest::getRtcpPort() const {
     std::string transport = getTransport();
-    std::regex client_port_regex("client_port=\\d+-(\\d+)");
+    static const std::regex rtcp_port_regex("client_port=\\d+-(\\d+)");
     std::smatch match;
-    if (std::regex_search(transport, match, client_port_regex)) {
-        return std::stoi(match[1]);
+    if (std::regex_search(transport, match, rtcp_port_regex)) {
+        int32_t v = 0;
+        if (parseInt32Safe(match[1].str(), v) && v >= 0 && v <= 65535) return v;
     }
     return 0;
 }
@@ -321,7 +325,10 @@ bool RtspResponse::parse(const std::string& data) {
         reason = reason.substr(1);
     }
 
-    status_code_ = std::stoi(code_str);
+    {
+        int32_t v = 0;
+        status_code_ = parseInt32Safe(code_str, v) ? v : 0;
+    }
     status_reason_ = reason;
 
     // 解析头部
@@ -345,9 +352,10 @@ bool RtspResponse::parse(const std::string& data) {
             
             headers_[name] = value;
             
-            // 提取CSeq
+            // 提取CSeq（安全解析，畸形值不抛异常）
             if (name == "CSeq") {
-                cseq_ = std::stoi(value);
+                int32_t v = 0;
+                cseq_ = parseInt32Safe(value, v) ? v : 0;
             }
         }
     }
