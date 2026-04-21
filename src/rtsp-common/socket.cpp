@@ -1,7 +1,16 @@
+// NOMINMAX 必须在任何 Windows 头之前定义，防止 windows.h 把 min/max 作为宏
+// 污染，从而破坏 std::min/std::max 以及 (std::numeric_limits<T>::max)() 等
+// 标准 API 调用。MSVC 下的 winsock2.h 会间接拉 windows.h。
+#if defined(_WIN32) && !defined(NOMINMAX)
+    #define NOMINMAX
+#endif
+
 #include <rtsp-common/socket.h>
 #include <rtsp-common/common.h>
 
+#include <algorithm>
 #include <cstring>
+#include <chrono>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -10,6 +19,13 @@
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
+    // 防御性：某些 Windows SDK 版本即便 NOMINMAX 也会在特定路径引入宏
+    #ifdef min
+        #undef min
+    #endif
+    #ifdef max
+        #undef max
+    #endif
     typedef int socklen_t;
     using pollfd = WSAPOLLFD;
     #ifndef POLLIN
