@@ -60,3 +60,21 @@ add_executable(rtsp_test_rtcp_ssrc test_rtcp_ssrc.cpp)
 target_link_libraries(rtsp_test_rtcp_ssrc PRIVATE rtsp-sdk)
 add_test(NAME test_rtcp_ssrc COMMAND rtsp_test_rtcp_ssrc)
 set_tests_properties(test_rtcp_ssrc PROPERTIES TIMEOUT 30)
+
+# ONVIF 相关测试（仅在启用 ONVIF 时构建）
+if(BUILD_ONVIF)
+    # WS-Discovery Probe 往返（可能在不支持多播的 CI 容器中跳过）
+    add_executable(rtsp_test_onvif_discovery test_onvif_discovery.cpp)
+    target_link_libraries(rtsp_test_onvif_discovery PRIVATE rtsp-sdk)
+    if(WIN32)
+        target_link_libraries(rtsp_test_onvif_discovery PRIVATE ws2_32)
+    endif()
+    add_test(NAME test_onvif_discovery COMMAND rtsp_test_onvif_discovery)
+    set_tests_properties(test_onvif_discovery PROPERTIES TIMEOUT 15)
+
+    # SOAP 端点 + WS-Security 鉴权 + GetStreamUri 正确性
+    add_executable(rtsp_test_onvif_soap test_onvif_soap.cpp)
+    target_link_libraries(rtsp_test_onvif_soap PRIVATE rtsp-sdk)
+    add_test(NAME test_onvif_soap COMMAND rtsp_test_onvif_soap)
+    set_tests_properties(test_onvif_soap PROPERTIES TIMEOUT 15)
+endif()
