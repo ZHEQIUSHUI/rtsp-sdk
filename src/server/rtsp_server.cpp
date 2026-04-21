@@ -146,6 +146,12 @@ bool joinThreadWithTimeout(std::thread& t, uint32_t timeout_ms) {
     return false;
 }
 
+int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 std::string toLowerCopy(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
@@ -777,11 +783,11 @@ struct ClientSession {
     std::atomic<uint32_t> packet_count{0};
     std::atomic<uint32_t> octet_count{0};
     
-    std::chrono::steady_clock::time_point last_activity;
+    std::atomic<int64_t> last_activity_ns{0};
     ServerStatsAtomic* stats = nullptr;
     
     ClientSession() {
-        last_activity = std::chrono::steady_clock::now();
+        last_activity_ns.store(steadyNowNs(), std::memory_order_relaxed);
     }
     
     ~ClientSession() {
@@ -869,7 +875,7 @@ struct ClientSession {
                     }
                     delete[] packet.data;
                 }
-                last_activity = std::chrono::steady_clock::now();
+                last_activity_ns.store(steadyNowNs(), std::memory_order_relaxed);
                 
                 // RTCP SR is only valid for UDP sender sessions.
                 if (!use_tcp_interleaved && rtp_sender && (packet_count % 100 == 0)) {
@@ -1002,7 +1008,7 @@ public:
                         }
                         buffer.erase(0, total);
                         if (session_) {
-                            session_->last_activity = std::chrono::steady_clock::now();
+                            session_->last_activity_ns.store(steadyNowNs(), std::memory_order_relaxed);
                         }
                         continue;
                     }
@@ -1077,7 +1083,7 @@ private:
             return;
         }
         if (session_) {
-            session_->last_activity = std::chrono::steady_clock::now();
+            session_->last_activity_ns.store(steadyNowNs(), std::memory_order_relaxed);
         }
         
         RTSP_LOG_INFO("RTSP " + RtspRequest::methodToString(request.getMethod()) + 
@@ -1145,8 +1151,22 @@ private:
         
         // 构建SDP
         SdpBuilder sdp;
-        // 使用 0.0.0.0 表示接受任何地址的连接
-        sdp.setConnection("IN", "IP4", "0.0.0.0");
+        // Use the actual local IP address of the RTSP control connection to maximize client compatibility.
+        // Some RTSP clients (e.g. live555/VLC) may "connect()" their UDP sockets to the SDP "c=" address.
+        // Using 0.0.0.0 can result in dropping all received RTP packets.
+        std::string sdp_ip = socket_ ? socket_->getLocalIp() : std::string();
+        if (sdp_ip.empty() || sdp_ip == "0.0.0.0") {
+            sdp_ip = "127.0.0.1";
+        }
+        // Rebuild the SDP header with the chosen IP.
+        auto now = std::chrono::system_clock::now();
+        auto epoch = now.time_since_epoch();
+        const uint64_t sess_id = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
+        sdp.setVersion()
+            .setOrigin("-", sess_id, sess_id, "IN", "IP4", sdp_ip)
+            .setSessionName("RTSP Stream")
+            .setTime();
+        sdp.setConnection("IN", "IP4", sdp_ip);
         
         // 计算payload type
         uint8_t payload_type = (config.codec == CodecType::H264) ? 96 : 97;
@@ -1390,7 +1410,8 @@ private:
                                    media_path->config.fps,
                                    session_->publisher_payload_type);
             std::weak_ptr<MediaPath> weak_path = media_path;
-            receiver->setCallback([weak_path, this](const VideoFrame& frame) {
+            std::weak_ptr<ClientSession> weak_session = session_;
+            receiver->setCallback([weak_path, weak_session, this](const VideoFrame& frame) {
                 if (auto path = weak_path.lock()) {
                     if (frame.codec == CodecType::H264 &&
                         (frame.type == FrameType::IDR || path->config.sps.empty() || path->config.pps.empty())) {
@@ -1402,6 +1423,9 @@ private:
                     }
                     path->broadcastFrame(frame);
                     stats_.frames_pushed++;
+                }
+                if (auto session = weak_session.lock()) {
+                    session->last_activity_ns.store(steadyNowNs(), std::memory_order_relaxed);
                 }
             });
             session_->rtp_receiver = std::move(receiver);
@@ -1466,7 +1490,7 @@ private:
         }
 
         session_->rtp_receiver->start();
-        session_->last_activity = std::chrono::steady_clock::now();
+        session_->last_activity_ns.store(steadyNowNs(), std::memory_order_relaxed);
 
         RtspResponse response = RtspResponse::createOk(cseq);
         response.setSession(session_->session_id);
@@ -1710,13 +1734,17 @@ public:
             std::vector<std::pair<std::string, std::string>> disconnects;
             {
                 std::lock_guard<std::mutex> lock(paths_mutex_);
-                auto now = std::chrono::steady_clock::now();
+                const int64_t now_ns = steadyNowNs();
+                const int64_t timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::milliseconds(config_.session_timeout_ms))
+                                               .count();
                 for (auto& path_pair : paths_) {
                     auto& path = path_pair.second;
                     std::lock_guard<std::mutex> session_lock(path->sessions_mutex);
                     for (auto it = path->sessions.begin(); it != path->sessions.end();) {
-                        auto last_activity = it->second->last_activity;
-                        if (now - last_activity > std::chrono::milliseconds(config_.session_timeout_ms)) {
+                        const int64_t last_activity_ns =
+                            it->second->last_activity_ns.load(std::memory_order_relaxed);
+                        if (last_activity_ns != 0 && now_ns - last_activity_ns > timeout_ns) {
                             RTSP_LOG_INFO("Session timeout: " + it->first);
                             it->second->stop();
                             stats_.sessions_closed++;

@@ -122,7 +122,24 @@ std::string RtspRequest::getTransport() const {
 }
 
 std::string RtspRequest::getSession() const {
-    return getHeader("Session");
+    std::string session = getHeader("Session");
+
+    // RFC2326 allows optional session parameters, e.g.:
+    //   Session: 12345678;timeout=60
+    // Some clients (e.g. live555/VLC) may include these parameters in subsequent requests.
+    // We only use the session-id for matching.
+    const size_t semi = session.find(';');
+    if (semi != std::string::npos) {
+        session = session.substr(0, semi);
+    }
+
+    // Trim spaces just in case.
+    const auto start = session.find_first_not_of(" \t");
+    if (start == std::string::npos) {
+        return std::string();
+    }
+    const auto end = session.find_last_not_of(" \t");
+    return session.substr(start, end - start + 1);
 }
 
 int RtspRequest::getRtpPort() const {

@@ -69,6 +69,76 @@ bool joinThreadWithTimeout(std::thread& t, uint32_t timeout_ms) {
     return false;
 }
 
+bool parseContentLength(const std::string& headers, std::size_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    static const std::regex kContentLengthRegex("Content-Length\\s*:\\s*(\\d+)", std::regex::icase);
+    std::smatch match;
+    if (!std::regex_search(headers, match, kContentLengthRegex)) {
+        return false;
+    }
+
+    try {
+        *out = static_cast<std::size_t>(std::stoull(match[1].str()));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool recvRtspResponse(Socket* socket, std::string* response, int timeout_ms) {
+    if (socket == nullptr || response == nullptr) {
+        return false;
+    }
+
+    response->clear();
+
+    const auto timeout = std::chrono::milliseconds(std::max(0, timeout_ms));
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    std::size_t expected_total_size = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remain =
+            static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+        const int poll_timeout_ms = std::min(200, std::max(1, remain));
+
+        char buffer[4096];
+        const ssize_t len = socket->recv(reinterpret_cast<std::uint8_t*>(buffer), sizeof(buffer), poll_timeout_ms);
+        if (len > 0) {
+            response->append(buffer, static_cast<std::size_t>(len));
+
+            if (expected_total_size == 0) {
+                const auto header_end_pos = response->find("\r\n\r\n");
+                if (header_end_pos != std::string::npos) {
+                    const std::size_t header_size = header_end_pos + 4;
+                    std::size_t content_length = 0;
+                    if (parseContentLength(response->substr(0, header_size), &content_length)) {
+                        expected_total_size = header_size + content_length;
+                    } else {
+                        expected_total_size = header_size;
+                    }
+                }
+            }
+
+            if (expected_total_size != 0 && response->size() >= expected_total_size) {
+                // Do not return extra bytes if the peer pipelined multiple RTSP responses.
+                response->resize(expected_total_size);
+                return true;
+            }
+        } else if (len == 0) {
+            // Peer closed.
+            break;
+        } else {
+            // Timeout / transient error.
+            continue;
+        }
+    }
+
+    return false;
+}
+
 } // namespace
 
 // RTP接收器实现（简化版）
@@ -536,7 +606,7 @@ public:
     bool use_digest_auth_ = false;
     std::string digest_realm_;
     std::string digest_nonce_;
-    std::string digest_qop_ = "auth";
+    std::string digest_qop_;
     uint32_t digest_nc_ = 0;
     bool use_tcp_transport_ = false;
     uint8_t interleaved_rtp_channel_ = 0;
@@ -831,11 +901,7 @@ public:
             if (control_socket_->send((const uint8_t*)req_str.c_str(), req_str.size()) <= 0) {
                 return false;
             }
-            char buffer[8192];
-            ssize_t len = control_socket_->recv((uint8_t*)buffer, sizeof(buffer), recv_timeout_ms);
-            if (len <= 0) return false;
-            response.assign(buffer, static_cast<size_t>(len));
-            return true;
+            return recvRtspResponse(control_socket_.get(), &response, recv_timeout_ms);
         };
 
         if (!send_once(true)) return false;
@@ -889,7 +955,33 @@ public:
             auto p = parseAuthParams(challenge.substr(7));
             digest_realm_ = p["realm"];
             digest_nonce_ = p["nonce"];
-            if (!p["qop"].empty()) digest_qop_ = p["qop"];
+            digest_qop_.clear();
+            if (!p["qop"].empty()) {
+                // qop can be a comma-separated list like "auth,auth-int". Pick a supported token.
+                std::string qop_list = p["qop"];
+                std::vector<std::string> tokens;
+                std::size_t pos = 0;
+                while (pos < qop_list.size()) {
+                    const auto comma = qop_list.find(',', pos);
+                    const auto end = comma == std::string::npos ? qop_list.size() : comma;
+                    std::string tok = qop_list.substr(pos, end - pos);
+                    // trim spaces
+                    while (!tok.empty() && std::isspace(static_cast<unsigned char>(tok.front()))) tok.erase(tok.begin());
+                    while (!tok.empty() && std::isspace(static_cast<unsigned char>(tok.back()))) tok.pop_back();
+                    if (!tok.empty()) tokens.push_back(tok);
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+                for (const auto& t : tokens) {
+                    if (t == "auth") {
+                        digest_qop_ = "auth";
+                        break;
+                    }
+                }
+                if (digest_qop_.empty() && !tokens.empty()) {
+                    digest_qop_ = tokens.front();
+                }
+            }
             use_digest_auth_ = !digest_realm_.empty() && !digest_nonce_.empty();
             return use_digest_auth_;
         }
@@ -904,20 +996,31 @@ public:
         if (auth_user_.empty() || auth_pass_.empty() || digest_nonce_.empty() || digest_realm_.empty()) {
             return "";
         }
-        digest_nc_++;
-        std::stringstream nc_ss;
-        nc_ss << std::hex << std::setw(8) << std::setfill('0') << digest_nc_;
-        std::string nc = nc_ss.str();
-        std::string cnonce = md5Hex(std::to_string(digest_nc_) + ":" + auth_user_ + ":" + uri).substr(0, 16);
         std::string ha1 = md5Hex(auth_user_ + ":" + digest_realm_ + ":" + auth_pass_);
         std::string ha2 = md5Hex(method + ":" + uri);
-        std::string response = md5Hex(ha1 + ":" + digest_nonce_ + ":" + nc + ":" + cnonce + ":" + digest_qop_ + ":" + ha2);
+        std::string response;
+        std::string nc;
+        std::string cnonce;
+        if (digest_qop_.empty()) {
+            // RFC 2069 style (no qop): response = MD5(HA1:nonce:HA2)
+            response = md5Hex(ha1 + ":" + digest_nonce_ + ":" + ha2);
+        } else {
+            // RFC 2617 style (with qop): response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+            digest_nc_++;
+            std::stringstream nc_ss;
+            nc_ss << std::hex << std::setw(8) << std::setfill('0') << digest_nc_;
+            nc = nc_ss.str();
+            cnonce = md5Hex(std::to_string(digest_nc_) + ":" + auth_user_ + ":" + uri).substr(0, 16);
+            response = md5Hex(ha1 + ":" + digest_nonce_ + ":" + nc + ":" + cnonce + ":" + digest_qop_ + ":" + ha2);
+        }
 
         std::ostringstream out;
         out << "Digest username=\"" << auth_user_ << "\", realm=\"" << digest_realm_
             << "\", nonce=\"" << digest_nonce_ << "\", uri=\"" << uri
-            << "\", response=\"" << response << "\", qop=" << digest_qop_
-            << ", nc=" << nc << ", cnonce=\"" << cnonce << "\"";
+            << "\", response=\"" << response << "\"";
+        if (!digest_qop_.empty()) {
+            out << ", qop=" << digest_qop_ << ", nc=" << nc << ", cnonce=\"" << cnonce << "\"";
+        }
         return out.str();
     }
 
