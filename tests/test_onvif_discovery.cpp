@@ -16,7 +16,9 @@
     #define NOMINMAX
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <BaseTsd.h>
     #pragma comment(lib, "ws2_32.lib")
+    typedef SSIZE_T ssize_t;
     using socklen_t_compat = int;
 #else
     #include <sys/socket.h>
@@ -68,7 +70,14 @@ static bool sendProbeAndRecv(const std::string& dst_ip, uint16_t dst_port,
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
     dst.sin_port = htons(dst_port);
-    dst.sin_addr.s_addr = inet_addr(dst_ip.c_str());
+    if (::inet_pton(AF_INET, dst_ip.c_str(), &dst.sin_addr) != 1) {
+#ifdef _WIN32
+        ::closesocket(s);
+#else
+        ::close(s);
+#endif
+        return false;
+    }
 
     const int pl = static_cast<int>(std::strlen(kProbe));
     if (::sendto(s, kProbe, pl, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) != pl) {

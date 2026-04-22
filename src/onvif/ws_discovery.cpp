@@ -17,6 +17,7 @@
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <BaseTsd.h>
     #pragma comment(lib, "ws2_32.lib")
     #ifdef min
         #undef min
@@ -24,6 +25,8 @@
     #ifdef max
         #undef max
     #endif
+    // MSVC 无 ssize_t；Windows SDK 的 SSIZE_T (BaseTsd.h) 即 signed intptr_t
+    typedef SSIZE_T ssize_t;
     typedef int socklen_t;
     using pollfd_t = WSAPOLLFD;
     static int ws_poll(pollfd_t* fds, size_t nfds, int timeout_ms) {
@@ -174,7 +177,11 @@ public:
         }
 
         ip_mreq mreq{};
-        mreq.imr_multiaddr.s_addr = inet_addr(kMulticastAddr);
+        // inet_addr 在 Windows SDK 上会报 deprecation；改用 inet_pton（跨平台）
+        if (::inet_pton(AF_INET, kMulticastAddr, &mreq.imr_multiaddr) != 1) {
+            closeSocketFd(fd);
+            return false;
+        }
         mreq.imr_interface.s_addr = htonl(INADDR_ANY);
         if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                          reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
