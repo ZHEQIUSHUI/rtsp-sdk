@@ -32,6 +32,21 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
 - **Observability**:
   - Structured logging (`plain` / `json`)
   - Server/client runtime stats API
+- **Industrial-grade hardening** (see [AUDIT_TODO.md](AUDIT_TODO.md)):
+  - No deadlocks under concurrent SETUP + push (MediaPath lock order fixed,
+    `cleanup_loop` decoupled from blocked `send_thread` join)
+  - TCP interleaved send uses bounded write timeout — stalled peers
+    can't hang the server
+  - Bounded request size (header ≤32KB / body ≤64KB) — slowloris / oversized
+    Content-Length DoS protection
+  - Safe numeric parsing (`parseInt32Safe` / `parseUint32Safe`) — malformed
+    SDP / headers can't crash connection threads
+  - RTP SSRC == RTCP SR SSRC (strict clients like live555 / GStreamer now
+    accept our SR)
+  - DESCRIBE responses include `Content-Base` header (consistent relative
+    control URL resolution across VLC / ffmpeg / GStreamer)
+  - `TCP_NODELAY` on all TCP sockets (RTSP control + RTP-over-TCP)
+  - Verified clean under ThreadSanitizer + AddressSanitizer + UBSan
 - **ONVIF Discovery (optional)**:
   - WS-Discovery responder on UDP multicast `239.255.255.250:3702`
   - SOAP over HTTP: ONVIF Profile S minimal subset
@@ -67,6 +82,21 @@ Windows (PowerShell):
 ```powershell
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
+```
+
+### CMake Options
+
+| Option | Default | Description |
+|---|---|---|
+| `BUILD_EXAMPLES` | `ON` | Build example executables under `examples/` |
+| `BUILD_TESTS` | `ON` | Build tests under `tests/` (ctest target) |
+| `BUILD_SHARED` | `OFF` | Build `rtsp-sdk` as a shared library instead of static |
+| `BUILD_ONVIF` | `ON` | Build ONVIF discovery + SOAP service (pulls in `third_party/httplib.h`; turn OFF for a minimal RTSP-only build) |
+
+Example: minimal RTSP-only build (no ONVIF, no httplib dependency):
+
+```bash
+cmake -S . -B build -DBUILD_ONVIF=OFF
 ```
 
 ## Run Tests
@@ -256,6 +286,31 @@ int main() {
 - `closeWithTimeout(ms)` - stop-safe close
 - `RtspPusher` - alias of `RtspPublisher`
 
+### ONVIF API
+
+Only available when built with `BUILD_ONVIF=ON` (default).
+Header: `#include <rtsp-onvif/rtsp-onvif.h>`
+
+- `OnvifDaemon::attachServer(RtspServer*)` - Bind to a running RTSP server; paths added via `addPath` are auto-exposed as ONVIF media profiles
+- `OnvifDaemon::setConfig(OnvifDaemonConfig)` - HTTP/RTSP ports, device metadata, WS-Security credentials
+- `OnvifDaemon::start()` / `stop()` / `stopWithTimeout(ms)` - Control WS-Discovery + SOAP endpoints
+- `OnvifDaemon::getStats()` - Discovery probe / match counts, SOAP request / auth failure counts
+
+Key config fields (see `include/rtsp-onvif/onvif_daemon.h`):
+
+- `http_port` / `rtsp_port` - SOAP listen port and advertised RTSP port
+- `device_info.{manufacturer,model,firmware,serial,hardware_id}` - Returned via `GetDeviceInformation`
+- `auth_username` / `auth_password` - WS-Security UsernameToken (empty = open access)
+- `anonymous_actions` - SOAP actions that bypass authentication (default: `GetSystemDateAndTime`, `GetCapabilities`)
+- `announce_host` / `announce_rtsp_host` - Override auto-detected IP in `XAddr` / `StreamUri` (useful for multi-NIC or NAT)
+
+Supported SOAP operations:
+
+- Device: `GetDeviceInformation`, `GetCapabilities`, `GetServices`, `GetSystemDateAndTime`
+- Media: `GetProfiles`, `GetVideoSources`, `GetStreamUri`, `GetSnapshotUri`
+
+Other operations return a SOAP Fault; clients degrade gracefully. PTZ, events, recording, and imaging services are not implemented.
+
 ## Project Structure
 
 ```
@@ -269,6 +324,9 @@ include/
   rtsp-publisher/     # Publish client public headers
     rtsp-publisher.h
     rtsp_publisher.h
+  rtsp-onvif/         # ONVIF public headers (BUILD_ONVIF=ON only)
+    rtsp-onvif.h
+    onvif_daemon.h
   rtsp-common/        # Common public headers
     common.h
 
@@ -281,9 +339,15 @@ src/
   server/             # Server implementation
   client/             # Client implementation
   publisher/          # RTSP publish implementation
+  onvif/              # ONVIF daemon: WS-Discovery, SOAP, WS-Security
+                      # (BUILD_ONVIF=ON only)
 
-examples/             # Example applications
-tests/                # Unit tests
+third_party/
+  httplib.h           # yhirose/cpp-httplib (MIT, single-header)
+                      # — used by ONVIF SOAP endpoint
+
+examples/             # Example applications (example_onvif_server etc.)
+tests/                # Unit + integration tests (ctest)
 ```
 
 ## License
