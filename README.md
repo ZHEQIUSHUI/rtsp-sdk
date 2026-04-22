@@ -32,6 +32,16 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
 - **Observability**:
   - Structured logging (`plain` / `json`)
   - Server/client runtime stats API
+- **ONVIF Discovery (optional)**:
+  - WS-Discovery responder on UDP multicast `239.255.255.250:3702`
+  - SOAP over HTTP: ONVIF Profile S minimal subset
+    (Device / Media services: `GetDeviceInformation`, `GetCapabilities`,
+    `GetServices`, `GetSystemDateAndTime`, `GetProfiles`, `GetVideoSources`,
+    `GetStreamUri`, `GetSnapshotUri`)
+  - WS-Security UsernameToken (PasswordDigest) authentication with nonce
+    replay protection
+  - Zero-config: paths you add via `RtspServer::addPath` auto-populate
+    ONVIF profiles
 - **Cross-Platform**: Linux / Windows
 
 ## Requirements
@@ -71,6 +81,60 @@ Windows (PowerShell):
 
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
+```
+
+## ONVIF
+
+Make your RTSP server discoverable on the LAN so NVR / VMS / ONVIF Device
+Manager can find it and fetch the stream URL automatically.
+
+Enabled by default. Disable with `-DBUILD_ONVIF=OFF` (then `third_party/httplib.h`
+is not required and nothing extra is compiled).
+
+### Minimal Usage
+
+```cpp
+#include <rtsp-server/rtsp-server.h>
+#include <rtsp-onvif/rtsp-onvif.h>
+
+using namespace rtsp;
+
+int main() {
+    RtspServer server;
+    server.init("0.0.0.0", 8554);
+    PathConfig cfg;
+    cfg.path = "/live/stream";
+    cfg.codec = CodecType::H264;
+    cfg.width = 1920; cfg.height = 1080; cfg.fps = 30;
+    server.addPath(cfg);
+    server.start();
+
+    OnvifDaemon onvif;
+    OnvifDaemonConfig ocfg;
+    ocfg.http_port = 8080;
+    ocfg.rtsp_port = 8554;
+    ocfg.device_info.manufacturer = "MyBrand";
+    ocfg.device_info.model        = "Cam1";
+    // Optional: WS-Security UsernameToken authentication (PasswordDigest).
+    // Leave username empty to run open.
+    ocfg.auth_username = "admin";
+    ocfg.auth_password = "secret123";
+    onvif.attachServer(&server);
+    onvif.setConfig(ocfg);
+    onvif.start();
+
+    // ... push frames via server.pushH264Data(...) ...
+}
+```
+
+ONVIF Device Manager, Blue Iris, Milestone XProtect, Synology Surveillance
+Station, and `onvif://` scanning tools will now discover the device and pull
+the stream URL via `GetStreamUri`.
+
+### Try with the ready-made example
+
+```bash
+./build/examples/example_onvif_server --port 8554 --http 8080 --path /live/stream --auth admin:secret123
 ```
 
 ## Soak Test
