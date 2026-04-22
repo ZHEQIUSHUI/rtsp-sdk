@@ -10,6 +10,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_SHARED "Build shared library" OFF)
+# ONVIF 子模块：局域网发现 + Profile S 最小 SOAP 服务。
+# 关闭时完全不编译 onvif/*，也不依赖 third_party/httplib.h。
+option(BUILD_ONVIF "Build ONVIF discovery + SOAP service" ON)
 
 # 所有源文件
 set(RTSP_SDK_SOURCES
@@ -34,6 +37,20 @@ set(RTSP_SDK_HEADERS
     include/rtsp-publisher/rtsp-publisher.h
 )
 
+# ONVIF 模块（可选）
+if(BUILD_ONVIF)
+    list(APPEND RTSP_SDK_SOURCES
+        src/onvif/onvif_daemon.cpp
+        src/onvif/soap_endpoint.cpp
+        src/onvif/ws_discovery.cpp
+        src/onvif/wsse_auth.cpp
+    )
+    list(APPEND RTSP_SDK_HEADERS
+        include/rtsp-onvif/onvif_daemon.h
+        include/rtsp-onvif/rtsp-onvif.h
+    )
+endif()
+
 # 创建库（单一库）
 if(BUILD_SHARED)
     add_library(rtsp-sdk SHARED ${RTSP_SDK_SOURCES})
@@ -53,6 +70,17 @@ target_include_directories(rtsp-sdk
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<INSTALL_INTERFACE:include>
 )
+
+# ONVIF 专用：httplib 单头文件路径（仅构建期可见，外部消费者不需要）
+if(BUILD_ONVIF)
+    target_include_directories(rtsp-sdk
+        PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
+    target_compile_definitions(rtsp-sdk PUBLIC RTSP_SDK_WITH_ONVIF=1)
+    # Windows 下 iphlpapi 用来枚举本机 IP
+    if(WIN32)
+        target_link_libraries(rtsp-sdk PUBLIC iphlpapi)
+    endif()
+endif()
 
 # 编译选项
 target_compile_options(rtsp-sdk PRIVATE
@@ -101,6 +129,12 @@ install(EXPORT rtsp-sdk-targets
 install(FILES ${RTSP_SDK_HEADERS}
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk
 )
+
+if(BUILD_ONVIF)
+    install(DIRECTORY include/rtsp-onvif/
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk/rtsp-onvif
+            FILES_MATCHING PATTERN "*.h")
+endif()
 
 # CMake config
 include(CMakePackageConfigHelpers)

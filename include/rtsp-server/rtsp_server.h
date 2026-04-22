@@ -82,6 +82,10 @@ public:
     
     // 删除媒体路径
     bool removePath(const std::string& path);
+
+    // 获取当前所有路径的配置快照（线程安全，返回拷贝）。
+    // 用于 ONVIF daemon 等外部模块动态生成 profile；避免暴露内部结构。
+    std::vector<PathConfig> getPathsSnapshot() const;
     
     // 推送视频帧到指定路径（线程安全）
     bool pushFrame(const std::string& path, const VideoFrame& frame);
