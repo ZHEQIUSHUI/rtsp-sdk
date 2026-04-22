@@ -32,7 +32,7 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
 - **Observability**:
   - Structured logging (`plain` / `json`)
   - Server/client runtime stats API
-- **Industrial-grade hardening** (see [AUDIT_TODO.md](AUDIT_TODO.md)):
+- **Industrial-grade hardening**:
   - No deadlocks under concurrent SETUP + push (MediaPath lock order fixed,
     `cleanup_loop` decoupled from blocked `send_thread` join)
   - TCP interleaved send uses bounded write timeout — stalled peers
