@@ -669,10 +669,24 @@ ServerRegistry& globalServerRegistry() {
 // 支持格式: rtsp://host:port/path 或 /path
 static std::string extractPathFromUrl(const std::string& url) {
     if (url.empty()) return "/";
+
+    auto normalize_path = [](std::string path) -> std::string {
+        if (path.empty()) return "/";
+        if (path.front() != '/') {
+            path.insert(path.begin(), '/');
+        }
+        // Trim trailing '/' to improve client compatibility:
+        // some RTSP clients may append a trailing '/' to the base URL.
+        // Keep root '/' untouched.
+        while (path.size() > 1 && path.back() == '/') {
+            path.pop_back();
+        }
+        return path.empty() ? "/" : path;
+    };
     
     // 如果已经是纯路径（以/开头且没有scheme），直接返回
     if (url[0] == '/' && url.find("://") == std::string::npos) {
-        return url;
+        return normalize_path(url);
     }
     
     // 去除 scheme (rtsp://)
@@ -688,9 +702,9 @@ static std::string extractPathFromUrl(const std::string& url) {
         // 去除查询参数
         size_t query_pos = temp.find('?', path_pos);
         if (query_pos != std::string::npos) {
-            return temp.substr(path_pos, query_pos - path_pos);
+            return normalize_path(temp.substr(path_pos, query_pos - path_pos));
         }
-        return temp.substr(path_pos);
+        return normalize_path(temp.substr(path_pos));
     }
     
     return "/";
