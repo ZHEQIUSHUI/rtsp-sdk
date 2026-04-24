@@ -14,6 +14,7 @@
 //   numOfPPS (u8)
 //   PPS length (u16 BE) | PPS bytes
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 

@@ -92,30 +92,6 @@ jobs:
           UBSAN_OPTIONS: "print_stacktrace=1 halt_on_error=1"
         run: ctest --test-dir build-asan --output-on-failure
 
-  onvif-off:
-    name: Build with BUILD_ONVIF=OFF (no httplib dep)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure (onvif off)
-        run: cmake -S . -B build-noonvif -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_ONVIF=OFF
-      - name: Build
-        run: cmake --build build-noonvif --parallel
-      - name: Test
-        run: ctest --test-dir build-noonvif --output-on-failure
-
-  rtmp-off:
-    name: Build with BUILD_RTMP=OFF (no rtmp module)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure (rtmp off)
-        run: cmake -S . -B build-nortmp -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_RTMP=OFF
-      - name: Build
-        run: cmake --build build-nortmp --parallel
-      - name: Test
-        run: ctest --test-dir build-nortmp --output-on-failure
-
   rtmp-smoke:
     name: RTMP smoke (publish to mediamtx)
     runs-on: ubuntu-latest

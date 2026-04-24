@@ -100,14 +100,10 @@ cmake --build build --config Release
 | `BUILD_EXAMPLES` | `ON` | Build example executables under `examples/` |
 | `BUILD_TESTS` | `ON` | Build tests under `tests/` (ctest target) |
 | `BUILD_SHARED` | `OFF` | Build `rtsp-sdk` as a shared library instead of static |
-| `BUILD_ONVIF` | `ON` | Build ONVIF discovery + SOAP service (pulls in `third_party/httplib.h`; turn OFF for a minimal RTSP-only build) |
-| `BUILD_RTMP`  | `ON` | Build RTMP Publisher (push H.264/H.265 to external RTMP servers/CDNs) |
 
-Example: minimal RTSP-only build (no ONVIF, no httplib dependency):
-
-```bash
-cmake -S . -B build -DBUILD_ONVIF=OFF
-```
+The ONVIF daemon and RTMP publisher sub-modules are always built — they are
+small, header-only at the third-party level (only `httplib.h` in the tree),
+and having a single build target keeps downstream integration simple.
 
 ## Run Tests
 
@@ -127,9 +123,6 @@ ctest --test-dir build -C Release --output-on-failure
 
 Make your RTSP server discoverable on the LAN so NVR / VMS / ONVIF Device
 Manager can find it and fetch the stream URL automatically.
-
-Enabled by default. Disable with `-DBUILD_ONVIF=OFF` (then `third_party/httplib.h`
-is not required and nothing extra is compiled).
 
 ### Minimal Usage
 
@@ -182,8 +175,6 @@ the stream URL via `GetStreamUri`.
 Push H.264 / H.265 video to any RTMP server — live streaming platforms
 (Bilibili / Douyin / Kuaishou / YouTube / Twitch) or self-hosted relays
 (SRS, mediamtx, nginx-rtmp).
-
-Enabled by default. Disable with `-DBUILD_RTMP=OFF`.
 
 ### Minimal Usage
 

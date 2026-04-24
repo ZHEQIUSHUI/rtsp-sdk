@@ -10,12 +10,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_SHARED "Build shared library" OFF)
-# ONVIF 子模块：局域网发现 + Profile S 最小 SOAP 服务。
-# 关闭时完全不编译 onvif/*，也不依赖 third_party/httplib.h。
-option(BUILD_ONVIF "Build ONVIF discovery + SOAP service" ON)
-# RTMP Publisher 子模块：把 H.264/H.265 流推到外部 RTMP server（CDN / 直播）。
-# 关闭时完全不编译 rtmp/*。
-option(BUILD_RTMP "Build RTMP publisher" ON)
+# 注：ONVIF 与 RTMP Publisher 子模块不再提供 CMake 开关——它们都是纯 C++
+# 无额外外部依赖（ONVIF 用 third_party/httplib.h，RTMP 纯自带），编译体积
+# 增加有限，默认一起构建以简化下游集成。
 
 # 所有源文件
 set(RTSP_SDK_SOURCES
@@ -40,36 +37,32 @@ set(RTSP_SDK_HEADERS
     include/rtsp-publisher/rtsp-publisher.h
 )
 
-# ONVIF 模块（可选）
-if(BUILD_ONVIF)
-    list(APPEND RTSP_SDK_SOURCES
-        src/onvif/onvif_daemon.cpp
-        src/onvif/soap_endpoint.cpp
-        src/onvif/ws_discovery.cpp
-        src/onvif/wsse_auth.cpp
-    )
-    list(APPEND RTSP_SDK_HEADERS
-        include/rtsp-onvif/onvif_daemon.h
-        include/rtsp-onvif/rtsp-onvif.h
-    )
-endif()
+# ONVIF 模块
+list(APPEND RTSP_SDK_SOURCES
+    src/onvif/onvif_daemon.cpp
+    src/onvif/soap_endpoint.cpp
+    src/onvif/ws_discovery.cpp
+    src/onvif/wsse_auth.cpp
+)
+list(APPEND RTSP_SDK_HEADERS
+    include/rtsp-onvif/onvif_daemon.h
+    include/rtsp-onvif/rtsp-onvif.h
+)
 
-# RTMP Publisher 模块（可选）
-if(BUILD_RTMP)
-    list(APPEND RTSP_SDK_SOURCES
-        src/rtmp/rtmp_publisher.cpp
-        src/rtmp/rtmp_handshake.cpp
-        src/rtmp/rtmp_chunk_stream.cpp
-        src/rtmp/amf0_codec.cpp
-        src/rtmp/flv_tag_encoder.cpp
-        src/rtmp/avc_config_record.cpp
-        src/rtmp/hevc_config_record.cpp
-    )
-    list(APPEND RTSP_SDK_HEADERS
-        include/rtsp-rtmp/rtmp_publisher.h
-        include/rtsp-rtmp/rtsp-rtmp.h
-    )
-endif()
+# RTMP Publisher 模块
+list(APPEND RTSP_SDK_SOURCES
+    src/rtmp/rtmp_publisher.cpp
+    src/rtmp/rtmp_handshake.cpp
+    src/rtmp/rtmp_chunk_stream.cpp
+    src/rtmp/amf0_codec.cpp
+    src/rtmp/flv_tag_encoder.cpp
+    src/rtmp/avc_config_record.cpp
+    src/rtmp/hevc_config_record.cpp
+)
+list(APPEND RTSP_SDK_HEADERS
+    include/rtsp-rtmp/rtmp_publisher.h
+    include/rtsp-rtmp/rtsp-rtmp.h
+)
 
 # 创建库（单一库）
 if(BUILD_SHARED)
@@ -92,18 +85,11 @@ target_include_directories(rtsp-sdk
 )
 
 # ONVIF 专用：httplib 单头文件路径（仅构建期可见，外部消费者不需要）
-if(BUILD_ONVIF)
-    target_include_directories(rtsp-sdk
-        PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
-    target_compile_definitions(rtsp-sdk PUBLIC RTSP_SDK_WITH_ONVIF=1)
-    # Windows 下 iphlpapi 用来枚举本机 IP
-    if(WIN32)
-        target_link_libraries(rtsp-sdk PUBLIC iphlpapi)
-    endif()
-endif()
-
-if(BUILD_RTMP)
-    target_compile_definitions(rtsp-sdk PUBLIC RTSP_SDK_WITH_RTMP=1)
+target_include_directories(rtsp-sdk
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
+# Windows 下 iphlpapi 用来枚举本机 IP（ONVIF 发现）
+if(WIN32)
+    target_link_libraries(rtsp-sdk PUBLIC iphlpapi)
 endif()
 
 # 编译选项
@@ -154,17 +140,13 @@ install(FILES ${RTSP_SDK_HEADERS}
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk
 )
 
-if(BUILD_ONVIF)
-    install(DIRECTORY include/rtsp-onvif/
-            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk/rtsp-onvif
-            FILES_MATCHING PATTERN "*.h")
-endif()
+install(DIRECTORY include/rtsp-onvif/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk/rtsp-onvif
+        FILES_MATCHING PATTERN "*.h")
 
-if(BUILD_RTMP)
-    install(DIRECTORY include/rtsp-rtmp/
-            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk/rtsp-rtmp
-            FILES_MATCHING PATTERN "*.h")
-endif()
+install(DIRECTORY include/rtsp-rtmp/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk/rtsp-rtmp
+        FILES_MATCHING PATTERN "*.h")
 
 # CMake config
 include(CMakePackageConfigHelpers)

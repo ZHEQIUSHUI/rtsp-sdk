@@ -12,6 +12,7 @@
 // 一条消息（可能跨多个 chunk）装满后返回给调用方。
 
 #include <rtsp-common/socket.h>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>

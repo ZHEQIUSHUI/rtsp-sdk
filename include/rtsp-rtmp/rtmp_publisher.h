@@ -22,6 +22,7 @@
 
 #include <rtsp-common/common.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
