@@ -355,17 +355,15 @@ public:
         return doCommand("connect", tx, args, rtmp_csid::kInvoke, 0, &out, timeout_ms);
     }
 
-    bool doReleaseStream(int timeout_ms) {
+    bool doReleaseStream(int /*timeout_ms*/) {
         const uint32_t tx = next_transaction_id_++;
-        std::vector<amf0::ValuePtr> args = {
-            amf0::Value::makeNull(),
-            amf0::Value::makeString(stream_key_),
-        };
-        // 部分 server 完全不回（如 mediamtx 对 releaseStream），不强要求
+        // 部分 server 完全不回（如 mediamtx 对 releaseStream），不强要求，所以
+        // 这里不等 _result，timeout 参数只为签名一致性保留
         std::vector<uint8_t> body;
         amf0::encode(body, *amf0::Value::makeString("releaseStream"));
         amf0::encode(body, *amf0::Value::makeNumber(tx));
-        for (const auto& v : args) amf0::encode(body, *v);
+        amf0::encode(body, *amf0::Value::makeNull());
+        amf0::encode(body, *amf0::Value::makeString(stream_key_));
         return sendCommand(rtmp_csid::kInvoke, 0, std::move(body));
     }
 

@@ -28,6 +28,7 @@
 //   - H.265 mode=0 → Enhanced RTMP（推荐）
 //   - H.265 mode=1 → legacy codecID=12
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 

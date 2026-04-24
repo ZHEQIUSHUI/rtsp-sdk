@@ -16,6 +16,7 @@
 // 编码：流式追加到 std::vector<uint8_t>。
 // 解码：值树 AmfValue（递归结构）+ parse() 返回消费的字节数。
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>

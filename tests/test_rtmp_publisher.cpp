@@ -12,12 +12,24 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+// CHECK：等价于 assert，但不受 NDEBUG 影响（Release 也会执行和检查）。
+// 这个 test 有很多带副作用的表达式（如 pub.pushH264Data(...)），放在 assert()
+// 里在 Release/NDEBUG 下会被整个剥掉，测试变成无效。
+#define CHECK(expr) do { \
+    if (!(expr)) { \
+        std::cerr << "CHECK failed at " << __FILE__ << ":" << __LINE__ \
+                  << ": " << #expr << std::endl; \
+        std::abort(); \
+    } \
+} while (0)
 
 using namespace rtsp;
 using namespace std::chrono_literals;
@@ -385,15 +397,15 @@ int main() {
     // 推 3 帧（1 关键 + 2 普通）
     const auto idr = makeH264Idr();
     const auto p   = makeH264Inter();
-    assert(pub.pushH264Data(idr.data(), idr.size(), 0, true));
+    CHECK(pub.pushH264Data(idr.data(), idr.size(), 0, true));
     std::this_thread::sleep_for(30ms);
-    assert(pub.pushH264Data(p.data(), p.size(), 33, false));
+    CHECK(pub.pushH264Data(p.data(), p.size(), 33, false));
     std::this_thread::sleep_for(30ms);
-    assert(pub.pushH264Data(p.data(), p.size(), 66, false));
+    CHECK(pub.pushH264Data(p.data(), p.size(), 66, false));
 
     // 等 server 收到至少 2 帧（第一帧是 key，server 会分开计）
     const bool got_frames = srv.waitForFrames(2, 3000);
-    assert(got_frames);
+    CHECK(got_frames);
 
     // 断言
     const auto r = srv.snapshot();
@@ -412,28 +424,28 @@ int main() {
               << " first_byte=0x" << std::hex << int(r.first_video_byte) << std::dec
               << std::endl;
 
-    assert(r.handshake_done);
-    assert(r.got_connect);
-    assert(r.tc_url == "rtmp://127.0.0.1:" + std::to_string(kPort) + "/live");
-    assert(r.app == "live");
-    assert(r.assigned_stream_id == 1);
-    assert(r.publish_stream_key == "testkey");
-    assert(r.publish_type == "live");
-    assert(r.got_on_meta_data);
-    assert(r.meta_width == 1920);
-    assert(r.meta_height == 1080);
-    assert(r.meta_codec_num == 7);    // H.264 codec id
-    assert(r.got_avc_seq_header);
-    assert(r.video_frames >= 2);
+    CHECK(r.handshake_done);
+    CHECK(r.got_connect);
+    CHECK(r.tc_url == "rtmp://127.0.0.1:" + std::to_string(kPort) + "/live");
+    CHECK(r.app == "live");
+    CHECK(r.assigned_stream_id == 1);
+    CHECK(r.publish_stream_key == "testkey");
+    CHECK(r.publish_type == "live");
+    CHECK(r.got_on_meta_data);
+    CHECK(r.meta_width == 1920);
+    CHECK(r.meta_height == 1080);
+    CHECK(r.meta_codec_num == 7);    // H.264 codec id
+    CHECK(r.got_avc_seq_header);
+    CHECK(r.video_frames >= 2);
     // 首帧 is_key=true → 0x17
-    assert(r.first_video_byte == 0x17);
+    CHECK(r.first_video_byte == 0x17);
 
     const auto st = pub.getStats();
     std::cout << "stats: messages_sent=" << st.messages_sent
               << " frames_sent=" << st.video_frames_sent
               << " bytes_sent=" << st.bytes_sent
               << " chunks=" << st.chunk_count << std::endl;
-    assert(st.video_frames_sent == 3);
+    CHECK(st.video_frames_sent == 3);
 
     pub.closeWithTimeout(1000);
     srv.stop();
