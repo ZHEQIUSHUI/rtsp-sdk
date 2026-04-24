@@ -13,6 +13,9 @@ option(BUILD_SHARED "Build shared library" OFF)
 # ONVIF 子模块：局域网发现 + Profile S 最小 SOAP 服务。
 # 关闭时完全不编译 onvif/*，也不依赖 third_party/httplib.h。
 option(BUILD_ONVIF "Build ONVIF discovery + SOAP service" ON)
+# RTMP Publisher 子模块：把 H.264/H.265 流推到外部 RTMP server（CDN / 直播）。
+# 关闭时完全不编译 rtmp/*。
+option(BUILD_RTMP "Build RTMP publisher" ON)
 
 # 所有源文件
 set(RTSP_SDK_SOURCES
@@ -51,6 +54,23 @@ if(BUILD_ONVIF)
     )
 endif()
 
+# RTMP Publisher 模块（可选）
+if(BUILD_RTMP)
+    list(APPEND RTSP_SDK_SOURCES
+        src/rtmp/rtmp_publisher.cpp
+        src/rtmp/rtmp_handshake.cpp
+        src/rtmp/rtmp_chunk_stream.cpp
+        src/rtmp/amf0_codec.cpp
+        src/rtmp/flv_tag_encoder.cpp
+        src/rtmp/avc_config_record.cpp
+        src/rtmp/hevc_config_record.cpp
+    )
+    list(APPEND RTSP_SDK_HEADERS
+        include/rtsp-rtmp/rtmp_publisher.h
+        include/rtsp-rtmp/rtsp-rtmp.h
+    )
+endif()
+
 # 创建库（单一库）
 if(BUILD_SHARED)
     add_library(rtsp-sdk SHARED ${RTSP_SDK_SOURCES})
@@ -80,6 +100,10 @@ if(BUILD_ONVIF)
     if(WIN32)
         target_link_libraries(rtsp-sdk PUBLIC iphlpapi)
     endif()
+endif()
+
+if(BUILD_RTMP)
+    target_compile_definitions(rtsp-sdk PUBLIC RTSP_SDK_WITH_RTMP=1)
 endif()
 
 # 编译选项
@@ -133,6 +157,12 @@ install(FILES ${RTSP_SDK_HEADERS}
 if(BUILD_ONVIF)
     install(DIRECTORY include/rtsp-onvif/
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk/rtsp-onvif
+            FILES_MATCHING PATTERN "*.h")
+endif()
+
+if(BUILD_RTMP)
+    install(DIRECTORY include/rtsp-rtmp/
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rtsp-sdk/rtsp-rtmp
             FILES_MATCHING PATTERN "*.h")
 endif()
 

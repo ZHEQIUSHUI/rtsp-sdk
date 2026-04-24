@@ -21,3 +21,9 @@ if(BUILD_ONVIF)
     add_executable(example_onvif_server onvif_server_example.cpp)
     target_link_libraries(example_onvif_server PRIVATE rtsp-sdk)
 endif()
+
+# RTMP 推流示例（只在启用 RTMP 时构建）
+if(BUILD_RTMP)
+    add_executable(example_rtmp_publisher rtmp_publisher_example.cpp)
+    target_link_libraries(example_rtmp_publisher PRIVATE rtsp-sdk)
+endif()

@@ -57,6 +57,15 @@ A lightweight C++ RTSP server and client SDK for H.264/H.265 video streaming.
     replay protection
   - Zero-config: paths you add via `RtspServer::addPath` auto-populate
     ONVIF profiles
+- **RTMP Publisher (optional)**:
+  - Push H.264 / H.265 to external RTMP servers (CDN, live platforms, SRS /
+    mediamtx / nginx-rtmp)
+  - Simple handshake (C0-C2 / S0-S2), works with most servers and CDNs
+  - Auto-extract SPS/PPS/VPS from the first keyframe and send AVC/HVC sequence
+    header
+  - Annex-B → AVCC conversion built in; caller keeps feeding raw Annex-B
+  - H.265 via two modes: Enhanced RTMP (FourCC `hvc1`, international standard)
+    or legacy `codecId=12` (Bilibili / Douyin / Kuaishou compatible)
 - **Cross-Platform**: Linux / Windows
 
 ## Requirements
@@ -92,6 +101,7 @@ cmake --build build --config Release
 | `BUILD_TESTS` | `ON` | Build tests under `tests/` (ctest target) |
 | `BUILD_SHARED` | `OFF` | Build `rtsp-sdk` as a shared library instead of static |
 | `BUILD_ONVIF` | `ON` | Build ONVIF discovery + SOAP service (pulls in `third_party/httplib.h`; turn OFF for a minimal RTSP-only build) |
+| `BUILD_RTMP`  | `ON` | Build RTMP Publisher (push H.264/H.265 to external RTMP servers/CDNs) |
 
 Example: minimal RTSP-only build (no ONVIF, no httplib dependency):
 
@@ -166,6 +176,73 @@ the stream URL via `GetStreamUri`.
 ```bash
 ./build/examples/example_onvif_server --port 8554 --http 8080 --path /live/stream --auth admin:secret123
 ```
+
+## RTMP Publisher
+
+Push H.264 / H.265 video to any RTMP server — live streaming platforms
+(Bilibili / Douyin / Kuaishou / YouTube / Twitch) or self-hosted relays
+(SRS, mediamtx, nginx-rtmp).
+
+Enabled by default. Disable with `-DBUILD_RTMP=OFF`.
+
+### Minimal Usage
+
+```cpp
+#include <rtsp-rtmp/rtsp-rtmp.h>
+
+using namespace rtsp;
+
+int main() {
+    RtmpPublisher pub;
+
+    RtmpPublishMediaInfo media;
+    media.codec = CodecType::H264;
+    media.width = 1920; media.height = 1080; media.fps = 30;
+    media.bitrate_kbps = 4000;
+    // SPS/PPS optional; if empty, auto-extracted from the first IDR keyframe
+
+    if (!pub.open("rtmp://live.example.com/app/streamkey", media)) {
+        std::cerr << pub.getLastError() << std::endl;
+        return 1;
+    }
+
+    // Feed Annex-B H.264 frames (with 00 00 00 01 start codes).
+    // Library does Annex-B → AVCC conversion and sends AVC sequence header on
+    // the first keyframe automatically.
+    while (running) {
+        pub.pushH264Data(frame_data, frame_size, pts_ms, is_keyframe);
+    }
+
+    pub.closeWithTimeout(1500);
+}
+```
+
+### H.265
+
+Two payload modes, selected via `RtmpPublishConfig::h265_mode`:
+
+- `0` (default) — Enhanced RTMP with FourCC `hvc1` (YouTube 2022 spec, modern international)
+- `1` — legacy `codecId=12` (accepted by Bilibili, Douyin, Kuaishou and most Chinese CDNs)
+
+```cpp
+RtmpPublishConfig cfg;
+cfg.h265_mode = 1;  // for China CDNs
+pub.setConfig(cfg);
+```
+
+### Try with mediamtx
+
+```bash
+docker run --rm -p 1935:1935 -p 8554:8554 bluenviron/mediamtx:latest
+./build/examples/example_rtmp_publisher rtmp://127.0.0.1:1935/live/test
+ffplay rtmp://127.0.0.1:1935/live/test     # or rtsp://127.0.0.1:8554/live/test
+```
+
+### Known limitations
+
+- Simple handshake only; YouTube / Twitch require complex handshake (HMAC-SHA256 validated) — not yet implemented
+- Video only; no audio
+- No auto-reconnect; callers implement via `open`/`close` loop
 
 ## Soak Test
 
@@ -311,6 +388,19 @@ Supported SOAP operations:
 
 Other operations return a SOAP Fault; clients degrade gracefully. PTZ, events, recording, and imaging services are not implemented.
 
+### RTMP Publisher API
+
+Only available when built with `BUILD_RTMP=ON` (default).
+Header: `#include <rtsp-rtmp/rtsp-rtmp.h>`
+
+- `RtmpPublisher::setConfig(RtmpPublishConfig)` - Timeouts, out chunk size, H.265 mode
+- `RtmpPublisher::open(url, RtmpPublishMediaInfo)` - TCP connect + handshake + connect + createStream + publish + onMetaData; returns false on any failure (`getLastError()` for reason)
+- `RtmpPublisher::pushH264Data(data, size, pts_ms, is_key)` - Push Annex-B H.264 frame
+- `RtmpPublisher::pushH265Data(data, size, pts_ms, is_key)` - Push Annex-B H.265 frame
+- `RtmpPublisher::closeWithTimeout(ms)` - FCUnpublish + deleteStream + close socket, honors `ms`
+- `RtmpPublisher::getStats()` - Messages / frames / bytes / chunk count counters
+- `RtmpPusher` - alias of `RtmpPublisher`
+
 ## Project Structure
 
 ```
@@ -327,6 +417,9 @@ include/
   rtsp-onvif/         # ONVIF public headers (BUILD_ONVIF=ON only)
     rtsp-onvif.h
     onvif_daemon.h
+  rtsp-rtmp/          # RTMP public headers (BUILD_RTMP=ON only)
+    rtsp-rtmp.h
+    rtmp_publisher.h
   rtsp-common/        # Common public headers
     common.h
 
@@ -341,6 +434,8 @@ src/
   publisher/          # RTSP publish implementation
   onvif/              # ONVIF daemon: WS-Discovery, SOAP, WS-Security
                       # (BUILD_ONVIF=ON only)
+  rtmp/               # RTMP publisher: handshake, chunk stream, AMF0,
+                      # FLV tag encoder (BUILD_RTMP=ON only)
 
 third_party/
   httplib.h           # yhirose/cpp-httplib (MIT, single-header)
