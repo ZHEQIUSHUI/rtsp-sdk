@@ -104,6 +104,56 @@ jobs:
       - name: Test
         run: ctest --test-dir build-noonvif --output-on-failure
 
+  rtmp-off:
+    name: Build with BUILD_RTMP=OFF (no rtmp module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (rtmp off)
+        run: cmake -S . -B build-nortmp -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_RTMP=OFF
+      - name: Build
+        run: cmake --build build-nortmp --parallel
+      - name: Test
+        run: ctest --test-dir build-nortmp --output-on-failure
+
+  rtmp-smoke:
+    name: RTMP smoke (publish to mediamtx)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+          cmake --build build --parallel
+      # 起一个真实的 mediamtx 作为 RTMP server，把我们 publisher 推的流收下来
+      # 并验证 ffprobe 能读出正确的 video 流信息。
+      - name: Start mediamtx
+        run: |
+          docker run -d --name mtx -p 1935:1935 -p 8554:8554 -p 8889:8889 \
+            bluenviron/mediamtx:latest
+          sleep 3
+          docker logs mtx | tail -20
+      - name: Install ffprobe
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      - name: Publish + verify
+        run: |
+          set -e
+          # 在后台推 5 秒钟
+          timeout 8 ./build/examples/example_rtmp_publisher \
+            rtmp://127.0.0.1:1935/live/ci-test &
+          PUB_PID=$!
+          sleep 3
+          # 用 ffprobe 从同一 mediamtx 拉 RTSP（mediamtx 自动跨协议转发）或 RTMP
+          RESP=$(ffprobe -v quiet -print_format json -show_streams \
+            -rw_timeout 5000000 \
+            rtmp://127.0.0.1:1935/live/ci-test || true)
+          echo "$RESP"
+          # 起码能看到 codec_name = h264（FLV AVC）
+          echo "$RESP" | grep -q '"codec_name": "h264"'
+          wait $PUB_PID 2>/dev/null || true
+          docker rm -f mtx || true
+
   stress:
     name: Stress (concurrent setup loop)
     runs-on: ubuntu-latest
