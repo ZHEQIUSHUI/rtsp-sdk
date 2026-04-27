@@ -272,15 +272,15 @@ bool WsDiscoveryResponder::start() {
 
 void WsDiscoveryResponder::stop() {
     if (!impl_->running_.exchange(false)) return;
-    // 关 socket 让 poll/recvfrom 立刻返回
-    const int fd = impl_->sock_fd_.exchange(-1);
+    // 仅 shutdown 唤醒 worker 的 recvfrom，关 fd 交给 worker 自己做。
+    // 这样避免主线程 close(fd) 与 worker 的 recvfrom(fd) 并发访问同一 fd 号（TSan race）。
+    const int fd = impl_->sock_fd_.load();
     if (fd >= 0) {
 #ifdef _WIN32
         ::shutdown(fd, SD_BOTH);
 #else
         ::shutdown(fd, SHUT_RDWR);
 #endif
-        closeSocketFd(fd);
     }
     if (impl_->thread_.joinable()) impl_->thread_.join();
     RTSP_LOG_INFO("WsDiscovery stopped");

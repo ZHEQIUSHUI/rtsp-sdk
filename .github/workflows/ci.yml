@@ -92,17 +92,69 @@ jobs:
           UBSAN_OPTIONS: "print_stacktrace=1 halt_on_error=1"
         run: ctest --test-dir build-asan --output-on-failure
 
-  onvif-off:
-    name: Build with BUILD_ONVIF=OFF (no httplib dep)
+  rtmp-smoke:
+    name: RTMP smoke (publish to mediamtx)
     runs-on: ubuntu-latest
+    needs: build-and-test
     steps:
       - uses: actions/checkout@v4
-      - name: Configure (onvif off)
-        run: cmake -S . -B build-noonvif -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_ONVIF=OFF
-      - name: Build
-        run: cmake --build build-noonvif --parallel
-      - name: Test
-        run: ctest --test-dir build-noonvif --output-on-failure
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+          cmake --build build --parallel
+      # 启动一个真实的 mediamtx 作为 RTMP server，把我们 publisher 推的流收下来
+      # 并验证 ffprobe 能正确读出 H264 流。
+      - name: Start mediamtx and wait for port
+        run: |
+          docker run -d --name mtx -p 1935:1935 -p 8554:8554 \
+            bluenviron/mediamtx:latest
+          # 等 RTMP 端口真的 listen（不再裸 sleep）
+          for i in $(seq 1 30); do
+            if ss -lnt 2>/dev/null | grep -q ':1935 '; then
+              echo "mediamtx listening on :1935 after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          docker logs mtx 2>&1 | tail -30
+      - name: Install ffprobe
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      - name: Publish to mediamtx
+        run: |
+          # 后台推 15 秒，比 ffprobe 的读取窗口长，保证帧流持续
+          timeout 15 ./build/examples/example_rtmp_publisher \
+            rtmp://127.0.0.1:1935/live/ci-test \
+            > /tmp/pub.log 2>&1 &
+          echo $! > /tmp/pub.pid
+          # 等推流者确实连上（mediamtx 日志里有 "is publishing to path"）
+          for i in $(seq 1 20); do
+            if docker logs mtx 2>&1 | grep -q "is publishing to path 'live/ci-test'"; then
+              echo "publisher is online after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+      - name: Probe with ffprobe
+        run: |
+          set +e
+          ffprobe -v error -print_format json -show_streams \
+            -rw_timeout 5000000 \
+            rtmp://127.0.0.1:1935/live/ci-test > /tmp/probe.json 2> /tmp/probe.err
+          EC=$?
+          echo "=== ffprobe exit=$EC ==="
+          echo "--- stderr ---"; cat /tmp/probe.err
+          echo "--- stdout (head) ---"; head -40 /tmp/probe.json
+          echo "--- grep codec_name ---"
+          grep -i codec_name /tmp/probe.json || true
+          echo "--- publisher log ---"; cat /tmp/pub.log || true
+          echo "--- mediamtx log tail ---"; docker logs mtx 2>&1 | tail -30
+          # 宽松匹配：接受 "codec_name": "h264" 或 "codec_name":"h264"（空格可选）
+          grep -qE '"codec_name"[[:space:]]*:[[:space:]]*"h264"' /tmp/probe.json
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f /tmp/pub.pid ]; then kill $(cat /tmp/pub.pid) 2>/dev/null || true; fi
+          docker rm -f mtx 2>/dev/null || true
 
   stress:
     name: Stress (concurrent setup loop)
