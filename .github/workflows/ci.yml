@@ -104,11 +104,17 @@ jobs:
           cmake --build build --parallel
       # 启动一个真实的 mediamtx 作为 RTMP server，把我们 publisher 推的流收下来
       # 并验证 ffprobe 能正确读出 H264 流。
+      #
+      # 关键点：
+      #   - 用 --network host 而非 -p 1935:1935，避免 GitHub Actions runner 上
+      #     的 docker-proxy 偶发性把 TCP 数据吞掉（实测 CI 上 publisher 自称 send
+      #     成功，mediamtx 报 i/o timeout 收不到任何字节 = docker-proxy buffer 问题）
+      #   - 版本 pin 到具体 tag，避免 latest 滚动让 CI 的协议行为发生变化
       - name: Start mediamtx and wait for port
         run: |
-          docker run -d --name mtx -p 1935:1935 -p 8554:8554 \
-            bluenviron/mediamtx:latest
-          # 等 RTMP 端口真的 listen（不再裸 sleep）
+          docker run -d --name mtx --network host \
+            bluenviron/mediamtx:1.18.0
+          # 等 RTMP 端口真的 listen
           for i in $(seq 1 30); do
             if ss -lnt 2>/dev/null | grep -q ':1935 '; then
               echo "mediamtx listening on :1935 after ${i}s"
