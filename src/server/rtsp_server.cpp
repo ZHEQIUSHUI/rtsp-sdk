@@ -42,14 +42,19 @@ void forEachAnnexBNalu(const uint8_t* data, size_t size, Fn&& fn) {
         return;
     }
 
-    std::vector<size_t> starts;
+    /* Each entry: { start-code begin offset, NAL payload begin offset }.
+     * Storing both lets us terminate a NAL payload at the *start of the
+     * next start code* rather than at the next NAL byte — otherwise the
+     * trailing bytes of every NAL include the next NAL's start code,
+     * which corrupts SPS/PPS extraction (VLC then refuses the SDP). */
+    std::vector<std::pair<size_t, size_t>> starts;
     starts.reserve(16);
     for (size_t i = 0; i + 3 < size; ++i) {
         if (hasStartCode4(data, size, i)) {
-            starts.push_back(i + 4);
+            starts.emplace_back(i, i + 4);
             i += 3;
         } else if (hasStartCode3(data, size, i)) {
-            starts.push_back(i + 3);
+            starts.emplace_back(i, i + 3);
             i += 2;
         }
     }
@@ -60,8 +65,10 @@ void forEachAnnexBNalu(const uint8_t* data, size_t size, Fn&& fn) {
     }
 
     for (size_t idx = 0; idx < starts.size(); ++idx) {
-        const size_t nalu_start = starts[idx];
-        size_t nalu_end = (idx + 1 < starts.size()) ? starts[idx + 1] : size;
+        const size_t nalu_start = starts[idx].second;
+        const size_t nalu_end   = (idx + 1 < starts.size())
+                                  ? starts[idx + 1].first  /* next start code, exclusive */
+                                  : size;
         if (nalu_end > nalu_start) {
             fn(data + nalu_start, nalu_end - nalu_start);
         }
