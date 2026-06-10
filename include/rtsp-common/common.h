@@ -90,6 +90,10 @@ std::string base64Encode(const uint8_t* data, size_t size);
 std::vector<uint8_t> base64Decode(const std::string& str);
 std::string md5Hex(const std::string& data);
 
+// XML 文本转义（& < > " '）。用于把任何不可信/可配置字符串拼进 XML/SOAP
+// 响应前转义，避免注入和因 & / < 破坏整份响应的良构性。
+std::string xmlEscape(const std::string& text);
+
 // 安全整数解析：失败时返回 false 并将 out 置为 0。
 // 用于所有来自网络的字段（CSeq/端口/payload_type 等），避免 std::stoi 抛异常
 // 时穿透连接处理线程、让恶意/畸形输入造成 DoS 式崩溃。
