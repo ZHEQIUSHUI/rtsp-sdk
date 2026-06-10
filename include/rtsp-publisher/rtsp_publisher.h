@@ -10,6 +10,10 @@ namespace rtsp {
 struct RtspPublishConfig {
     std::string user_agent = "RtspPublisher/1.0";
     uint16_t local_rtp_port = 25000;
+    // RTSP 鉴权凭据（用于需 Digest 鉴权的录制端/CDN）。也可直接写进 URL，
+    // 形如 rtsp://user:pass@host/path；URL 里的凭据优先于这里。
+    std::string username;
+    std::string password;
 };
 
 struct PublishMediaInfo {

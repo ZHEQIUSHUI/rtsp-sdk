@@ -62,6 +62,85 @@ void test_invalid_announce_rejected() {
     std::cout << "invalid ANNOUNCE rejection passed!" << std::endl;
 }
 
+PublishMediaInfo makeMedia() {
+    PublishMediaInfo media;
+    media.codec = CodecType::H264;
+    media.payload_type = 96;
+    media.width = 640; media.height = 480; media.fps = 25;
+    media.sps = {0x67, 0x42, 0x00, 0x28};
+    media.pps = {0x68, 0xCE, 0x3C, 0x80};
+    media.control_track = "streamid=0";
+    return media;
+}
+
+void test_publisher_digest_auth() {
+    std::cout << "Testing publisher digest auth..." << std::endl;
+
+    RtspServerConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 19772;
+    cfg.auth_enabled = true;
+    cfg.auth_use_digest = true;
+    cfg.auth_username = "pubuser";
+    cfg.auth_password = "pubpass";
+    cfg.auth_realm = "PublishRealm";
+    cfg.auth_nonce_ttl_ms = 30000;   // 充裕，避免 nonce 在握手中过期成 stale 循环
+    RtspServer server;
+    assert(server.init(cfg));
+    assert(server.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const PublishMediaInfo media = makeMedia();
+
+    // 1) 无凭据：server 401，announce 失败（auth_user 为空不重试）
+    {
+        RtspPublisher pub;
+        RtspPublishConfig pc; pc.local_rtp_port = 25070;
+        pub.setConfig(pc);
+        assert(pub.open("rtsp://127.0.0.1:19772/live/auth"));
+        assert(!pub.announce(media) && "no-credential ANNOUNCE must fail with 401");
+        pub.close();
+    }
+
+    // 2) URL 带凭据：401 → 解析 Digest 挑战 → 带 Authorization 重发 → 成功
+    {
+        RtspPublisher pub;
+        RtspPublishConfig pc; pc.local_rtp_port = 25072;
+        pub.setConfig(pc);
+        assert(pub.open("rtsp://pubuser:pubpass@127.0.0.1:19772/live/auth"));
+        assert(pub.announce(media) && "URL-credential ANNOUNCE must succeed via digest");
+        assert(pub.setup());
+        assert(pub.record());
+        pub.close();
+    }
+
+    // 3) config 带凭据（URL 不带）：同样成功
+    {
+        RtspPublisher pub;
+        RtspPublishConfig pc;
+        pc.local_rtp_port = 25074;
+        pc.username = "pubuser";
+        pc.password = "pubpass";
+        pub.setConfig(pc);
+        assert(pub.open("rtsp://127.0.0.1:19772/live/auth2"));
+        assert(pub.announce(media) && "config-credential ANNOUNCE must succeed via digest");
+        pub.close();
+    }
+
+    // 4) 错误密码：announce 失败（重发后仍 401）
+    {
+        RtspPublisher pub;
+        RtspPublishConfig pc; pc.local_rtp_port = 25076;
+        pub.setConfig(pc);
+        assert(pub.open("rtsp://pubuser:wrongpw@127.0.0.1:19772/live/auth3"));
+        assert(!pub.announce(media) && "wrong-password ANNOUNCE must fail");
+        pub.close();
+    }
+
+    server.stop();
+    std::cout << "publisher digest auth passed!" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -134,5 +213,6 @@ int main() {
     std::cout << "publisher -> builtin server -> client bridge passed!" << std::endl;
 
     test_invalid_announce_rejected();
+    test_publisher_digest_auth();
     return 0;
 }
