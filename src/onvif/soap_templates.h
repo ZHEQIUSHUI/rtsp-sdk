@@ -6,6 +6,8 @@
 #include <rtsp-onvif/onvif_daemon.h>
 #include "soap_endpoint.h"
 
+#include <rtsp-common/common.h>   // xmlEscape
+
 #include <sstream>
 #include <string>
 #include <vector>
@@ -33,7 +35,7 @@ inline std::string faultResponse(const std::string& reason) {
     oss << envelopeOpen()
         << "<soap:Fault>"
         <<   "<soap:Code><soap:Value>soap:Sender</soap:Value></soap:Code>"
-        <<   "<soap:Reason><soap:Text xml:lang=\"en\">" << reason << "</soap:Text></soap:Reason>"
+        <<   "<soap:Reason><soap:Text xml:lang=\"en\">" << xmlEscape(reason) << "</soap:Text></soap:Reason>"
         << "</soap:Fault>"
         << envelopeClose();
     return oss.str();
@@ -44,11 +46,11 @@ inline std::string getDeviceInformationResponse(const OnvifDeviceInfo& info) {
     std::ostringstream oss;
     oss << envelopeOpen()
         << "<tds:GetDeviceInformationResponse>"
-        <<   "<tds:Manufacturer>" << info.manufacturer << "</tds:Manufacturer>"
-        <<   "<tds:Model>"        << info.model        << "</tds:Model>"
-        <<   "<tds:FirmwareVersion>" << info.firmware  << "</tds:FirmwareVersion>"
-        <<   "<tds:SerialNumber>" << info.serial       << "</tds:SerialNumber>"
-        <<   "<tds:HardwareId>"   << info.hardware_id  << "</tds:HardwareId>"
+        <<   "<tds:Manufacturer>" << xmlEscape(info.manufacturer) << "</tds:Manufacturer>"
+        <<   "<tds:Model>"        << xmlEscape(info.model)        << "</tds:Model>"
+        <<   "<tds:FirmwareVersion>" << xmlEscape(info.firmware)  << "</tds:FirmwareVersion>"
+        <<   "<tds:SerialNumber>" << xmlEscape(info.serial)       << "</tds:SerialNumber>"
+        <<   "<tds:HardwareId>"   << xmlEscape(info.hardware_id)  << "</tds:HardwareId>"
         << "</tds:GetDeviceInformationResponse>"
         << envelopeClose();
     return oss.str();
@@ -134,12 +136,12 @@ inline std::string getServicesResponse(const std::string& media_xaddr,
         << "<tds:GetServicesResponse>"
         <<   "<tds:Service>"
         <<     "<tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace>"
-        <<     "<tds:XAddr>" << device_xaddr << "</tds:XAddr>"
+        <<     "<tds:XAddr>" << xmlEscape(device_xaddr) << "</tds:XAddr>"
         <<     "<tds:Version><tt:Major>2</tt:Major><tt:Minor>42</tt:Minor></tds:Version>"
         <<   "</tds:Service>"
         <<   "<tds:Service>"
         <<     "<tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>"
-        <<     "<tds:XAddr>" << media_xaddr << "</tds:XAddr>"
+        <<     "<tds:XAddr>" << xmlEscape(media_xaddr) << "</tds:XAddr>"
         <<     "<tds:Version><tt:Major>2</tt:Major><tt:Minor>42</tt:Minor></tds:Version>"
         <<   "</tds:Service>"
         << "</tds:GetServicesResponse>"
@@ -150,10 +152,10 @@ inline std::string getServicesResponse(const std::string& media_xaddr,
 // Media: VideoSource 片段（每个 profile 一个）
 inline std::string videoSourceFragment(const SoapEndpoint::MediaProfile& p) {
     std::ostringstream oss;
-    oss << "<tt:VideoSourceConfiguration token=\"VideoSourceToken_" << p.token << "\">"
-        <<   "<tt:Name>VideoSource_" << p.name << "</tt:Name>"
+    oss << "<tt:VideoSourceConfiguration token=\"VideoSourceToken_" << xmlEscape(p.token) << "\">"
+        <<   "<tt:Name>VideoSource_" << xmlEscape(p.name) << "</tt:Name>"
         <<   "<tt:UseCount>1</tt:UseCount>"
-        <<   "<tt:SourceToken>VideoSource_" << p.token << "</tt:SourceToken>"
+        <<   "<tt:SourceToken>VideoSource_" << xmlEscape(p.token) << "</tt:SourceToken>"
         <<   "<tt:Bounds x=\"0\" y=\"0\" width=\"" << p.width << "\" height=\"" << p.height << "\"/>"
         << "</tt:VideoSourceConfiguration>";
     return oss.str();
@@ -162,8 +164,8 @@ inline std::string videoSourceFragment(const SoapEndpoint::MediaProfile& p) {
 inline std::string videoEncoderFragment(const SoapEndpoint::MediaProfile& p) {
     const std::string encoding = (p.codec == CodecType::H265) ? "H265" : "H264";
     std::ostringstream oss;
-    oss << "<tt:VideoEncoderConfiguration token=\"VideoEncoderToken_" << p.token << "\">"
-        <<   "<tt:Name>VideoEncoder_" << p.name << "</tt:Name>"
+    oss << "<tt:VideoEncoderConfiguration token=\"VideoEncoderToken_" << xmlEscape(p.token) << "\">"
+        <<   "<tt:Name>VideoEncoder_" << xmlEscape(p.name) << "</tt:Name>"
         <<   "<tt:UseCount>1</tt:UseCount>"
         <<   "<tt:Encoding>" << encoding << "</tt:Encoding>"
         <<   "<tt:Resolution>"
@@ -183,8 +185,8 @@ inline std::string videoEncoderFragment(const SoapEndpoint::MediaProfile& p) {
 
 inline std::string profileFragment(const SoapEndpoint::MediaProfile& p) {
     std::ostringstream oss;
-    oss << "<trt:Profiles fixed=\"true\" token=\"" << p.token << "\">"
-        <<   "<tt:Name>" << p.name << "</tt:Name>"
+    oss << "<trt:Profiles fixed=\"true\" token=\"" << xmlEscape(p.token) << "\">"
+        <<   "<tt:Name>" << xmlEscape(p.name) << "</tt:Name>"
         <<   videoSourceFragment(p)
         <<   videoEncoderFragment(p)
         << "</trt:Profiles>";
@@ -208,7 +210,7 @@ inline std::string getVideoSourcesResponse(const std::vector<SoapEndpoint::Media
     oss << envelopeOpen()
         << "<trt:GetVideoSourcesResponse>";
     for (const auto& p : profiles) {
-        oss << "<trt:VideoSources token=\"VideoSource_" << p.token << "\">"
+        oss << "<trt:VideoSources token=\"VideoSource_" << xmlEscape(p.token) << "\">"
             <<   "<tt:Framerate>" << p.fps << "</tt:Framerate>"
             <<   "<tt:Resolution>"
             <<     "<tt:Width>" << p.width << "</tt:Width>"
@@ -232,7 +234,7 @@ inline std::string getStreamUriResponse(const std::string& rtsp_host, uint16_t r
     std::ostringstream oss;
     oss << envelopeOpen()
         << "<trt:GetStreamUriResponse><trt:MediaUri>"
-        <<   "<tt:Uri>" << uri.str() << "</tt:Uri>"
+        <<   "<tt:Uri>" << xmlEscape(uri.str()) << "</tt:Uri>"
         <<   "<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>"
         <<   "<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>"
         <<   "<tt:Timeout>PT60S</tt:Timeout>"

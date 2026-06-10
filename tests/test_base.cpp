@@ -143,15 +143,44 @@ void test_sdp_builder() {
     std::cout << "  SDP builder tests passed!" << std::endl;
 }
 
+void test_xml_escape() {
+    std::cout << "Testing xmlEscape..." << std::endl;
+
+    // 五个 XML 特殊字符各自转义
+    assert(xmlEscape("&") == "&amp;");
+    assert(xmlEscape("<") == "&lt;");
+    assert(xmlEscape(">") == "&gt;");
+    assert(xmlEscape("\"") == "&quot;");
+    assert(xmlEscape("'") == "&apos;");
+
+    // 普通文本与空串原样返回
+    assert(xmlEscape("") == "");
+    assert(xmlEscape("test-model_v1.0") == "test-model_v1.0");
+
+    // 混合 + 注入向量：任何 < & 都被转义，结果不含裸标签起始
+    const std::string injected =
+        "x</soap:Text></soap:Reason></soap:Fault><injected/>";
+    const std::string escaped = xmlEscape(injected);
+    assert(escaped.find('<') == std::string::npos);
+    assert(escaped.find("&lt;/soap:Text&gt;") != std::string::npos);
+    assert(escaped.find("&lt;injected/&gt;") != std::string::npos);
+
+    // & 不会被二次转义成 &amp;amp; —— 只对真正的特殊字符转一次
+    assert(xmlEscape("a&b<c") == "a&amp;b&lt;c");
+
+    std::cout << "  xmlEscape tests passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Base Tests ===" << std::endl;
-    
+
     try {
         test_base64();
         test_video_frame();
         test_rtp_timestamp();
         test_nalu_parsing();
         test_sdp_builder();
+        test_xml_escape();
         
         std::cout << "\n=== All Base Tests Passed! ===" << std::endl;
         return 0;

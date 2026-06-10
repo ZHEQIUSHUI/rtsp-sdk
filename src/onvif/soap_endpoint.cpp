@@ -204,6 +204,9 @@ bool SoapEndpoint::start(uint16_t http_port) {
     impl_->http_port_ = http_port;
 
     auto server = std::make_unique<httplib::Server>();
+    // 限制请求体大小：SOAP 请求实际 < 8KB；httplib 默认上限 100MB，会把整个
+    // body 缓冲进内存再跑 regex，几个并发大请求即可耗尽内存（DoS）。64KB 足够。
+    server->set_payload_max_length(64 * 1024);
     // Device service
     server->Post(impl_->device_path_, [this](const httplib::Request& req, httplib::Response& res) {
         impl_->handle(req, res, /*is_device_service=*/true);

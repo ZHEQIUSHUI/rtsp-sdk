@@ -71,8 +71,13 @@ std::string isoNowUtc(int offset_seconds) {
 }
 
 std::string makeSecurityHeader(const std::string& user, const std::string& pass) {
-    // nonce：8 字节固定值即可（本测试里使用一次，不会重放）
-    const uint8_t nonce_raw[8] = {1,2,3,4,5,6,7,8};
+    // nonce 必须每次调用都不同：服务端防重放 key = nonce|created，固定 nonce +
+    // 秒级 created 会让同一秒内的第二个鉴权请求被（正确地）判为重放而 401。
+    static unsigned s_nonce_ctr = 0;
+    const unsigned c = ++s_nonce_ctr;
+    const uint8_t nonce_raw[8] = {1, 2, 3, 4,
+        static_cast<uint8_t>(c >> 24), static_cast<uint8_t>(c >> 16),
+        static_cast<uint8_t>(c >> 8),  static_cast<uint8_t>(c)};
     const std::string nonce_b64 =
         base64Encode(nonce_raw, sizeof(nonce_raw));
     const std::string created = isoNowUtc(0);

@@ -46,6 +46,7 @@
     #include <fcntl.h>
     #include <errno.h>
     #include <poll.h>
+    #include <netdb.h>
 #endif
 
 namespace rtsp {
@@ -147,6 +148,35 @@ public:
     }
 };
 
+// 把 "1.2.3.4" 或主机名解析成 IPv4 sockaddr_in.sin_addr。
+// 先走 inet_pton 快路径（点分十进制），失败再用 getaddrinfo 做 DNS 解析。
+// 解析不出来返回 false，让调用方干净失败，而不是悄悄连到 0.0.0.0。
+// 注：connect 的目标常是主机名（RTSP 客户端 / RTSP・RTMP 推流到 CDN），
+// 必须支持 DNS；bind/sendTo 的地址按设计是数值 IP，保持 inet_pton 即可。
+static bool resolveIPv4(const std::string& host, struct in_addr& out) {
+    if (inet_pton(AF_INET, host.c_str(), &out) == 1) {
+        return true;
+    }
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;        // 当前仅支持 IPv4
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+        return false;
+    }
+    bool ok = false;
+    for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        if (p->ai_family == AF_INET && p->ai_addr) {
+            out = ((struct sockaddr_in*)p->ai_addr)->sin_addr;
+            ok = true;
+            break;
+        }
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
 Socket::Socket() : impl_(std::make_unique<Impl>()) {}
 Socket::Socket(int fd) : impl_(std::make_unique<Impl>(fd)) {}
 Socket::~Socket() = default;
@@ -209,7 +239,11 @@ bool Socket::connect(const std::string& ip, uint16_t port, int timeout_ms) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    // 支持主机名（DNS）目标；解析失败干净返回，不连 0.0.0.0
+    if (!resolveIPv4(ip, addr.sin_addr)) {
+        impl_->close();
+        return false;
+    }
 
     if (timeout_ms > 0) {
         setNonBlocking(true);

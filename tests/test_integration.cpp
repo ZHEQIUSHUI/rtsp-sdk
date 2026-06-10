@@ -591,7 +591,13 @@ void test_tcp_interleaved_streaming() {
     assert(cs.frames_output >= 1);
 
     push_thread.join();
+    // RTP 发送是异步的（sendLoop 线程）：大帧的 ~117 个 FU-A 分片在 push 返回/join 之后
+    // 仍在发送队列里。轮询等待计数到位，而不是 join 后立刻读一次（否则与 sendLoop 竞争）。
     auto ss = server.getStats();
+    for (int i = 0; i < 50 && ss.rtp_packets_sent < 100; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ss = server.getStats();
+    }
     assert(ss.rtp_packets_sent >= 100);
     assert(ss.frames_pushed >= 1);
     client.close();
@@ -611,7 +617,11 @@ void test_digest_auth() {
     cfg.auth_password = "dp";
     cfg.auth_realm = "DigestRealm";
     cfg.auth_nonce = "fixednonce123";
-    cfg.auth_nonce_ttl_ms = 1;
+    // TTL 必须远大于客户端往返：服务端每个请求先查 nonce 是否过期，过期就换新
+    // nonce 回 stale=true。若 TTL 比 RTT 还小（如 1ms），带新 nonce 的重试到达时又
+    // 过期，形成无限 stale 循环，客户端重试到上限仍失败。50ms ≫ 亚毫秒 RTT，稳健；
+    // 下方 200ms sleep ≫ 50ms 仍能可靠触发一次 stale 路径。
+    cfg.auth_nonce_ttl_ms = 50;
 
     RtspServer server;
     assert(server.init(cfg));
@@ -625,7 +635,7 @@ void test_digest_auth() {
 
     RtspClient digest_client;
     assert(digest_client.open("rtsp://du:dp@127.0.0.1:19663/live"));
-    std::this_thread::sleep_for(std::chrono::milliseconds(5)); // force nonce stale path
+    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // force nonce stale path (> TTL)
     assert(digest_client.describe());
     assert(digest_client.setup(0));
     assert(digest_client.play(0));
