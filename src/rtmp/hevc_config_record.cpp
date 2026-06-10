@@ -21,6 +21,22 @@ void appendNaluArray(std::vector<uint8_t>& out,
     out.insert(out.end(), nalu.begin(), nalu.end());
 }
 
+// 去除 NAL 里的 emulation-prevention 字节（00 00 03 -> 00 00），得到 RBSP。
+// profile_tier_level 必须在 RBSP 上读：Main/Main10 的 compatibility+constraint
+// 区几乎全是 00，编码器必然插入 00 00 03，裸拷原始 NAL 字节会整体错位。
+std::vector<uint8_t> stripEmulationPrevention(const uint8_t* p, size_t n) {
+    std::vector<uint8_t> rbsp;
+    rbsp.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        // 紧跟两个 0x00 之后的 0x03 是 emulation_prevention_three_byte，丢弃
+        if (i >= 2 && p[i] == 0x03 && p[i - 1] == 0x00 && p[i - 2] == 0x00) {
+            continue;
+        }
+        rbsp.push_back(p[i]);
+    }
+    return rbsp;
+}
+
 }  // namespace
 
 // H.265 NAL unit types（选用到的）
@@ -34,44 +50,43 @@ std::vector<uint8_t> buildHevcDecoderConfigRecord(
     const std::vector<uint8_t>& pps) {
 
     std::vector<uint8_t> out;
-    if (sps.size() < 14) {
-        // SPS 太短，无法安全提取 profile；返回空让调用方放弃
+
+    // profile_tier_level 位于 SPS 的 RBSP 中，先去除 emulation-prevention 字节再读。
+    // RBSP 布局：[0..1] NAL 头, [2] sps_video_parameter_set_id(4)|
+    //            sps_max_sub_layers_minus1(3)|sps_temporal_id_nesting(1),
+    //            [3] general_profile_space(2)|tier_flag(1)|profile_idc(5),
+    //            [4..7] general_profile_compatibility_flags(32),
+    //            [8..13] general_constraint_indicator_flags(48),
+    //            [14] general_level_idc(8)
+    std::vector<uint8_t> rbsp = stripEmulationPrevention(sps.data(), sps.size());
+    if (rbsp.size() < 15) {
+        // SPS 太短，无法安全提取 profile_tier_level；返回空让调用方放弃
         return out;
     }
+    const uint8_t* s = rbsp.data();
 
     // ---- 22-byte fixed header ----
     out.push_back(0x01);                // configurationVersion = 1
 
-    // profile_space(2)|tier_flag(1)|profile_idc(5)：从 SPS 里第 2~3 字节拿
-    // SPS NALU 前两字节是 NAL header；此后是 sps_video_parameter_set_id(4 bits) +
-    // sps_max_sub_layers_minus1(3) + sps_temporal_id_nesting(1)，然后是
-    // profile_tier_level。为简单起见，直接复制 SPS 偏移 1 处以后常见的 profile 字段：
-    // SPS[1..12] 是 profile_tier_level 的一部分。不同 encoder 排版略有差别，
-    // 这里按 FFmpeg 实现的处理方式：
-    const uint8_t* s = sps.data();
-    // SPS 解析这里保守做：完整从 SPS byte 1 开始的 12 字节都拷过来给
-    // general_profile_tier_level。这是 FFmpeg 生成 hvcC 时常用的近似做法。
-    // 有些 encoder 会在 SPS 里做 emulation prevention byte，现实中绝大部分
-    // 接收端对这 12 字节仅做显示用途，不校验细节位图。
-    uint8_t profile_space_tier_idc = s[1];
-    out.push_back(profile_space_tier_idc);
+    // general_profile_space(2)|tier_flag(1)|profile_idc(5)
+    out.push_back(s[3]);
 
     // general_profile_compatibility_flags (32 bits)
-    out.push_back(s[2]);
-    out.push_back(s[3]);
     out.push_back(s[4]);
     out.push_back(s[5]);
-
-    // general_constraint_indicator_flags (48 bits)
     out.push_back(s[6]);
     out.push_back(s[7]);
+
+    // general_constraint_indicator_flags (48 bits)
     out.push_back(s[8]);
     out.push_back(s[9]);
     out.push_back(s[10]);
     out.push_back(s[11]);
+    out.push_back(s[12]);
+    out.push_back(s[13]);
 
     // general_level_idc (8 bits)
-    out.push_back(s[12]);
+    out.push_back(s[14]);
 
     // reserved(4)|min_spatial_segmentation_idc(12) = 0xF000
     out.push_back(0xF0); out.push_back(0x00);

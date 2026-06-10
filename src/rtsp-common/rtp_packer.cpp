@@ -58,12 +58,16 @@ enum H265NaluType {
 
 // 查找NALU起始码
 static const uint8_t* findStartCode(const uint8_t* data, size_t size, size_t& start_code_len) {
-    for (size_t i = 0; i + 3 < size; i++) {
+    // 3 字节码 00 00 01 需访问 data[i+2]，故界为 i+2 < size；
+    // 4 字节码 00 00 00 01 需访问 data[i+3]，故内层判 i+3 < size。
+    // 旧界 i+3 < size / i+4 < size 会漏掉位于缓冲末尾的起始码，导致末尾短 NALU
+    // 被吞进上一个 NALU（24/7 流间歇性最后一个 AU 损坏）。
+    for (size_t i = 0; i + 2 < size; i++) {
         if (data[i] == 0 && data[i+1] == 0) {
             if (data[i+2] == 1) {
                 start_code_len = 3;
                 return data + i;
-            } else if (i + 4 < size && data[i+2] == 0 && data[i+3] == 1) {
+            } else if (i + 3 < size && data[i+2] == 0 && data[i+3] == 1) {
                 start_code_len = 4;
                 return data + i;
             }
@@ -77,7 +81,10 @@ static std::vector<NaluUnit> parseNalusInternal(const uint8_t* data, size_t size
     std::vector<NaluUnit> nalus;
     
     size_t offset = 0;
-    while (offset + 3 < size) {
+    // 用 offset < size（而非 offset+3 < size）确保缓冲末尾的起始码也被检查，
+    // 否则末尾的 00 00 01 会被当作上一个 NALU 的尾部数据。每轮 offset 严格递增
+    // （nalu_start ≥ offset + 起始码长度），不会空转。
+    while (offset < size) {
         // 查找起始码
         size_t start_code_len = 0;
         const uint8_t* start = findStartCode(data + offset, size - offset, start_code_len);
@@ -566,8 +573,11 @@ bool RtpSender::sendSenderReport(uint32_t rtp_timestamp, uint64_t ntp_timestamp,
     // RTCP header
     sr[0] = 0x80;  // V=2, P=0, RC=0
     sr[1] = 200;   // PT=SR
-    sr[2] = 0;     // length (in 32-bit words minus one)
-    sr[3] = 12;    // = 52/4 - 1 = 12
+    sr[2] = 0;     // length（以 32-bit word 计，减一）
+    // RC=0、无 report block，实际只发送 28 字节 = 7 个 word，length = 7-1 = 6。
+    // 此前写 12（=52 字节）与真实发送长度不符，严格 RTCP 解析器（live555、
+    // 部分 GStreamer）会据此判定包越界而丢弃整个 SR，导致 A/V 同步失效。
+    sr[3] = 6;
     
     // SSRC 与本会话 RTP 流一致（通过 setSsrc 配置），否则严格客户端会忽略 SR
     const uint32_t ssrc = impl_->ssrc_;
