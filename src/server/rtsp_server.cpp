@@ -244,6 +244,10 @@ public:
         payload_type_ = payload_type;
     }
 
+    // 限定只接收来自该 IP 的 RTP（= 推流端控制连接的对端 IP）。空则不限制。
+    // 接收 socket 绑 0.0.0.0 收任意源，不校验则任意主机都能往该端口注入/伪造帧。
+    void setExpectedSourceIp(const std::string& ip) { expected_source_ip_ = ip; }
+
     uint16_t getRtpPort() const { return rtp_port_; }
     uint16_t getRtcpPort() const { return rtcp_port_; }
 
@@ -374,6 +378,10 @@ private:
             if (r <= 0) continue;
             const ssize_t len = rtp_socket_.recvFrom(buffer, sizeof(buffer), from_ip, from_port);
             if (len > 0) {
+                // 丢弃非预期源的数据报，防止任意主机往本端口注入/伪造 RTP 帧
+                if (!expected_source_ip_.empty() && from_ip != expected_source_ip_) {
+                    continue;
+                }
                 ingestRtpPacket(buffer, static_cast<size_t>(len));
             }
         }
@@ -603,6 +611,7 @@ private:
     std::atomic<bool> running_{false};
     std::thread receive_thread_;
     FrameCallback callback_;
+    std::string expected_source_ip_;   // 仅接收此源 IP 的 RTP（空=不限制）
 
     CodecType codec_ = CodecType::H264;
     uint8_t payload_type_ = 96;
@@ -1407,14 +1416,19 @@ private:
             path = path.substr(0, slash_pos);
         }
 
-        std::lock_guard<std::mutex> lock(paths_mutex_);
-        auto it = paths_.find(path);
-        if (it == paths_.end()) {
-            sendResponse(RtspResponse::createError(cseq, 404, "Not Found"));
-            return;
+        // 仅在锁内查表并拷出 shared_ptr，随后释放 paths_mutex_，避免 32 次 bind
+        // 重试 + 打包器创建 + addSession 全程持锁，阻塞 DESCRIBE/其他 SETUP/cleanup。
+        // （handlePublisherSetup 已是此写法，这里对齐。）
+        std::shared_ptr<MediaPath> media_path;
+        {
+            std::lock_guard<std::mutex> lock(paths_mutex_);
+            auto it = paths_.find(path);
+            if (it == paths_.end()) {
+                sendResponse(RtspResponse::createError(cseq, 404, "Not Found"));
+                return;
+            }
+            media_path = it->second;
         }
-
-        auto& media_path = it->second;
 
         std::string transport = request.getTransport();
         const bool use_tcp = (transport.find("RTP/AVP/TCP") != std::string::npos ||
@@ -1568,6 +1582,8 @@ private:
                 return;
             }
 
+            // 只接受来自推流端控制连接对端 IP 的 RTP，挡掉任意源注入
+            receiver->setExpectedSourceIp(session_->client_ip);
             {
                 std::lock_guard<std::mutex> cfg_lock(media_path->config_mutex);
                 receiver->setVideoInfo(media_path->config.codec,
