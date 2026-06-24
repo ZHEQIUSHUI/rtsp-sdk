@@ -32,13 +32,20 @@ rtsp-cli pull -i rtsp://cam/stream -o - > raw.h264            # 裸流到 stdout
 ```
 
 ### push — 推流
-读本地视频 → 目标端口**无 RTSP 服务器则自起一个托管**、**已有则 ANNOUNCE/RECORD 推给它**；`rtmp://` 直接报错。`-r` 控制循环（-1 无限 / 0|1 一次 / N 次）。
+读本地视频 → 按目标协议：
+- `rtsp://`：端口**无服务器则自起一个托管**（消费者来拉）、**已有则 ANNOUNCE/RECORD 推给它**；端口被非 RTSP 服务占用（端口冲突）则报错，不强行。
+- `rtmp://`：用 RTMP 推给目标服务器/CDN（B 站/抖音/YouTube/mediamtx 等）。**RTMP 无法本地自起**，对端不在线直接报错。
+
+`-r` 控制循环（-1 无限 / 0|1 一次 / N 次）。
 
 ```
 rtsp-cli push -i in.mp4   -o rtsp://127.0.0.1:8554/live -r -1   # 自起 server 无限循环
-rtsp-cli push -i in.h264  -o rtsp://media-server:8554/live      # 推给已有 server
+rtsp-cli push -i in.h264  -o rtsp://media-server:8554/live      # 推给已有 RTSP server
 rtsp-cli push -i in.mp4   -o rtsp://srv/live --auth user:pass   # Digest 鉴权
+rtsp-cli push -i in.mp4   -o rtmp://127.0.0.1:1935/live/key     # 推到 RTMP 服务器/CDN
 ```
+
+> 注：`pull` 只支持 `rtsp://`（SDK 无 RTMP 收流端）。
 
 ## 容器 / 编码支持
 

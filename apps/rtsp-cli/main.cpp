@@ -42,7 +42,8 @@ void printPushHelp(std::FILE* out) {
     std::fprintf(out,
         "push:\n"
         "  -i, --input <file>         输入视频 (.mp4/.h264/.h265)               [必填]\n"
-        "  -o, --output <url>         目标 (rtsp://host:port/path；rtmp 报错)   [必填]\n"
+        "  -o, --output <url>         rtsp:// 或 rtmp:// 目标                    [必填]\n"
+        "                             rtsp 无服务器则自起托管；rtmp 需对端已在线，否则报错\n"
         "  -r, --loop <N>             循环: -1 无限 / 0|1 一次 / N 次 (默认 1)\n"
         "      --fps <n>              裸流无时间戳时的帧率 (mp4 用自带时基)\n"
         "      --auth <user:pass>     推到需鉴权服务器的凭据 (Digest)\n"
