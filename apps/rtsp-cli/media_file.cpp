@@ -84,13 +84,115 @@ void appendAnnexB(std::vector<uint8_t>& dst, const uint8_t* nal, size_t len) {
     dst.insert(dst.end(), nal, nal + len);
 }
 
+// ---- 最小 SPS 解析：从裸流的 SPS 拿分辨率/帧率（裸流不含其它尺寸来源）----
+
+// 去 emulation-prevention（00 00 03 -> 00 00），得到可按 bit 解析的 RBSP。
+std::vector<uint8_t> deEscape(const uint8_t* p, size_t n) {
+    std::vector<uint8_t> r; r.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (i >= 2 && p[i] == 0x03 && p[i-1] == 0x00 && p[i-2] == 0x00) continue;
+        r.push_back(p[i]);
+    }
+    return r;
+}
+
+struct BitRd {
+    const uint8_t* d; size_t nbits; size_t pos = 0;
+    BitRd(const uint8_t* p, size_t bytes) : d(p), nbits(bytes * 8) {}
+    int bit() { if (pos >= nbits) { ++pos; return 0; } int b = (d[pos >> 3] >> (7 - (pos & 7))) & 1; ++pos; return b; }
+    uint32_t u(int n) { uint32_t v = 0; while (n-- > 0) v = (v << 1) | (uint32_t)bit(); return v; }
+    uint32_t ue() { int z = 0; while (pos < nbits && bit() == 0 && z < 32) ++z; uint32_t v = (z < 32) ? ((1u << z) - 1) : 0; if (z) v += u(z); return v; }
+    int32_t se() { uint32_t k = ue(); return (k & 1) ? (int32_t)((k + 1) / 2) : -(int32_t)(k / 2); }
+    bool overrun() const { return pos > nbits; }
+};
+
+void skipScalingList(BitRd& b, int size) {
+    int last = 8, next = 8;
+    for (int j = 0; j < size; ++j) {
+        if (next != 0) { int delta = b.se(); next = (last + delta + 256) % 256; }
+        last = (next == 0) ? last : next;
+    }
+}
+
+// nal 含 1 字节 NAL 头。成功填 w/h（fps 若 VUI 有 timing 则填，否则 0）。
+bool parseH264Sps(const uint8_t* nal, size_t len, int& w, int& h, double& fps) {
+    if (len < 2) return false;
+    std::vector<uint8_t> rbsp = deEscape(nal + 1, len - 1);
+    BitRd b(rbsp.data(), rbsp.size());
+    uint32_t profile = b.u(8); b.u(8); b.u(8); b.ue();
+    uint32_t chroma = 1;
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+        profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 ||
+        profile == 139 || profile == 134 || profile == 135) {
+        chroma = b.ue();
+        if (chroma == 3) b.u(1);
+        b.ue(); b.ue(); b.u(1);
+        if (b.u(1)) { for (int i = 0; i < (chroma != 3 ? 8 : 12); ++i) if (b.u(1)) skipScalingList(b, i < 6 ? 16 : 64); }
+    }
+    b.ue();                       // log2_max_frame_num_minus4
+    uint32_t poc = b.ue();
+    if (poc == 0) b.ue();
+    else if (poc == 1) { b.u(1); b.se(); b.se(); uint32_t k = b.ue(); for (uint32_t i = 0; i < k; ++i) b.se(); }
+    b.ue();                       // max_num_ref_frames
+    b.u(1);                       // gaps_in_frame_num
+    uint32_t wmbs = b.ue(), hmap = b.ue();
+    uint32_t frame_only = b.u(1);
+    if (!frame_only) b.u(1);
+    b.u(1);                       // direct_8x8
+    uint32_t cl = 0, cr = 0, ct = 0, cb = 0;
+    if (b.u(1)) { cl = b.ue(); cr = b.ue(); ct = b.ue(); cb = b.ue(); }
+    if (b.overrun()) return false;
+    w = (int)((wmbs + 1) * 16);
+    h = (int)((2 - frame_only) * (hmap + 1) * 16);
+    int subW = (chroma == 1 || chroma == 2) ? 2 : 1;
+    int subH = (chroma == 1) ? 2 : 1;
+    int cux = (chroma == 0) ? 1 : subW;
+    int cuy = ((chroma == 0) ? 1 : subH) * (2 - frame_only);
+    w -= (int)(cl + cr) * cux;
+    h -= (int)(ct + cb) * cuy;
+    fps = 0;
+    if (b.u(1)) {                 // vui_parameters_present
+        if (b.u(1)) { if (b.u(8) == 255) { b.u(16); b.u(16); } }   // aspect_ratio
+        if (b.u(1)) b.u(1);                                        // overscan
+        if (b.u(1)) { b.u(3); b.u(1); if (b.u(1)) { b.u(8); b.u(8); b.u(8); } } // video_signal
+        if (b.u(1)) { b.ue(); b.ue(); }                           // chroma_loc
+        if (b.u(1)) { uint32_t nuit = b.u(32); uint32_t ts = b.u(32); b.u(1);
+                      if (nuit > 0) fps = (double)ts / (2.0 * nuit); }          // timing_info
+    }
+    return w > 0 && h > 0;
+}
+
+// HEVC：仅处理单子层(sps_max_sub_layers_minus1==0)的常见情形，取分辨率。
+bool parseH265Sps(const uint8_t* nal, size_t len, int& w, int& h) {
+    if (len < 3) return false;
+    std::vector<uint8_t> rbsp = deEscape(nal + 2, len - 2);
+    BitRd b(rbsp.data(), rbsp.size());
+    b.u(4);                       // sps_video_parameter_set_id
+    uint32_t maxsub = b.u(3);     // sps_max_sub_layers_minus1
+    b.u(1);                       // temporal_id_nesting
+    if (maxsub != 0) return false;
+    for (int i = 0; i < 12; ++i) b.u(8);  // profile_tier_level general（96 bit）
+    b.ue();                       // sps_seq_parameter_set_id
+    uint32_t chroma = b.ue();
+    if (chroma == 3) b.u(1);
+    uint32_t pw = b.ue(), ph = b.ue();
+    int W = (int)pw, H = (int)ph;
+    if (b.u(1)) {                 // conformance_window
+        uint32_t l = b.ue(), r = b.ue(), t = b.ue(), bo = b.ue();
+        int subW = (chroma == 1 || chroma == 2) ? 2 : 1, subH = (chroma == 1) ? 2 : 1;
+        W -= (int)(l + r) * subW; H -= (int)(t + bo) * subH;
+    }
+    if (b.overrun() || W <= 0 || H <= 0) return false;
+    w = W; h = H;
+    return true;
+}
+
 // ---------------- 裸流读 ----------------
 class RawEsReader : public MediaReader {
 public:
-    RawEsReader(std::vector<uint8_t> buf, CodecType codec, int fps)
-        : buf_(std::move(buf)), fps_(fps > 0 ? fps : 25) {
+    RawEsReader(std::vector<uint8_t> buf, CodecType codec, int forced_fps)
+        : buf_(std::move(buf)) {
         params_.codec = codec;
-        params_.fps = fps_;
         nals_ = parseNals(buf_.data(), buf_.size(), codec);
         buildUnits();
         for (const auto& nr : nals_) {
@@ -103,6 +205,21 @@ public:
                 else if (nr.type == 34 && params_.pps.empty()) params_.pps.assign(buf_.data()+nr.payload, buf_.data()+nr.end);
             }
         }
+        // 解析 SPS 补分辨率/帧率（裸流唯一可得的尺寸来源）
+        double sps_fps = 0; int w = 0, hh = 0;
+        if (!params_.sps.empty()) {
+            if (codec == CodecType::H264) {
+                if (parseH264Sps(params_.sps.data(), params_.sps.size(), w, hh, sps_fps)) {
+                    params_.width = w; params_.height = hh;
+                }
+            } else {
+                if (parseH265Sps(params_.sps.data(), params_.sps.size(), w, hh)) {
+                    params_.width = w; params_.height = hh;
+                }
+            }
+        }
+        fps_ = forced_fps > 0 ? forced_fps : (sps_fps > 0 ? (int)(sps_fps + 0.5) : 25);
+        params_.fps = fps_;
     }
 
     const MediaParams& params() const override { return params_; }
@@ -142,7 +259,7 @@ private:
     }
 
     std::vector<uint8_t> buf_;
-    int fps_;
+    int fps_ = 25;
     MediaParams params_;
     std::vector<NalRec> nals_;
     std::vector<Unit> units_;
