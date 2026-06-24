@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 选项
 option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_TESTS "Build tests" ON)
+option(BUILD_APPS "Build CLI apps (rtsp-cli)" ON)
 option(BUILD_SHARED "Build shared library" OFF)
 # 注：ONVIF 与 RTMP Publisher 子模块不再提供 CMake 开关——它们都是纯 C++
 # 无额外外部依赖（ONVIF 用 third_party/httplib.h，RTMP 纯自带），编译体积
@@ -112,6 +113,11 @@ add_library(rtsp::rtsp-sdk ALIAS rtsp-sdk)
 # Examples
 if(BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+# CLI apps
+if(BUILD_APPS)
+    add_subdirectory(apps/rtsp-cli)
 endif()
 
 # Tests

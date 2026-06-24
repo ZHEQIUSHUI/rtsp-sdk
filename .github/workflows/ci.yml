@@ -264,3 +264,73 @@ jobs:
           # 要求 UDP/TCP 至少有一帧通过；出现 'Invalid data' / 'No such file' 视为失败
           grep -q "Invalid data found when processing input" /tmp/udp.log && exit 1 || true
           grep -q "Invalid data found when processing input" /tmp/tcp.log && exit 1 || true
+
+  rtsp-cli-smoke:
+    name: rtsp-cli loopback (push self-host -> pull -> ffprobe)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build build --target rtsp-cli --parallel
+      - name: Install ffprobe
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      # push 用提交进仓库的小 .h264 自起 server 无限循环；pull 拉 3s 存 mp4；
+      # ffprobe 验证存出的 mp4 是有效 h264。无需编码器，零外部依赖。
+      - name: Loopback push + pull
+        run: |
+          set +e
+          BIN=build/apps/rtsp-cli/rtsp-cli
+          FIX=apps/rtsp-cli/testdata/sample.h264
+          "$BIN" push -i "$FIX" -o rtsp://127.0.0.1:8554/live -r -1 > /tmp/push.log 2>&1 &
+          PUSH=$!
+          for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ':8554 ' && break; sleep 0.25; done
+          "$BIN" pull -i rtsp://127.0.0.1:8554/live -o /tmp/out.mp4 -t 3 --quiet > /tmp/pull.log 2>&1
+          PULL_EC=$?
+          kill "$PUSH" 2>/dev/null
+          echo "=== push log ==="; cat /tmp/push.log
+          echo "=== pull log ==="; cat /tmp/pull.log
+          echo "=== ffprobe out.mp4 ==="
+          ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,nb_frames \
+            -of default=noprint_wrappers=1 /tmp/out.mp4
+          echo "pull exit=$PULL_EC"
+          test "$PULL_EC" = 0 || exit 1
+          ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 /tmp/out.mp4 | grep -q h264
+      # RTMP leg：push -r -1 推到真实 mediamtx，必须出现 "is publishing" 且 ffprobe 读出 h264。
+      # -r -1 跨循环边界，专门回归"循环时间戳必须单调"——倒退会让 RTMP 服务器拒绝建流。
+      # docker 网络偶发吞包，整段 3 次重试。
+      - name: RTMP push to mediamtx (loop-timestamp regression)
+        run: |
+          set +e
+          BIN=build/apps/rtsp-cli/rtsp-cli
+          FIX=apps/rtsp-cli/testdata/sample.h264
+          attempt() {
+            docker rm -f mtx >/dev/null 2>&1
+            docker run -d --name mtx --network host bluenviron/mediamtx:1.18.0 >/dev/null
+            for i in $(seq 1 30); do ss -lnt 2>/dev/null | grep -q ':1935 ' && break; sleep 1; done
+            "$BIN" push -i "$FIX" -o rtmp://127.0.0.1:1935/live/clicheck -r -1 > /tmp/rpush.log 2>&1 &
+            local pid=$!
+            local pub=0
+            for i in $(seq 1 30); do
+              docker logs mtx 2>&1 | grep -q "is publishing to path 'live/clicheck'" && { pub=1; break; }
+              sleep 0.5
+            done
+            local rc=1
+            if [ "$pub" = 1 ]; then
+              ffprobe -v error -rw_timeout 8000000 -select_streams v:0 -show_entries stream=codec_name \
+                -of csv=p=0 rtmp://127.0.0.1:1935/live/clicheck 2>/dev/null | grep -q h264 && rc=0
+            fi
+            kill "$pid" 2>/dev/null; pkill -x rtsp-cli 2>/dev/null
+            return $rc
+          }
+          for try in 1 2 3; do
+            echo "=== rtmp attempt ${try}/3 ==="
+            if attempt; then echo "rtsp-cli rtmp push OK on attempt ${try}"; exit 0; fi
+            echo "--- attempt ${try} failed; diagnostics ---"
+            cat /tmp/rpush.log 2>/dev/null; docker logs mtx 2>&1 | tail -15
+            sleep 2
+          done
+          echo "rtsp-cli rtmp push failed after 3 attempts"
+          exit 1
