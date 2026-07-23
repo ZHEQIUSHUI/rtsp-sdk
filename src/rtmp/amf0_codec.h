@@ -82,7 +82,8 @@ void encode(std::vector<uint8_t>& out, const Value& v);
 
 // --------- 解码 ----------
 // 从 data[0..len) 解析一个 AMF0 值，写入 *out。返回消费的字节数；失败返回 0。
-size_t parseValue(const uint8_t* data, size_t len, Value* out);
+// depth 限制嵌套递归深度，防不可信服务器发深度嵌套 Object/Array 撑爆栈（内部用）。
+size_t parseValue(const uint8_t* data, size_t len, Value* out, int depth = 0);
 
 // 一次解析多个值（RTMP command message 就是多个 AMF0 值的连续序列）。
 // 返回消费字节数，解析的值追加到 out_values。失败返回 0。

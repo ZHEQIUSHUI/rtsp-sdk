@@ -323,8 +323,16 @@ private:
         }
     }
 
+    // 单帧组装上限：正常视频帧远小于此。推流端（不可信）若始终不置 RTP marker 且
+    // 不变时间戳，frame_buffer_ 会无限增长 → 内存耗尽。超限即丢弃在建帧。
+    static constexpr size_t kMaxAssembledFrameBytes = 8 * 1024 * 1024;
+
     void appendAnnexBNalu(const uint8_t* nalu, size_t len) {
         if (!nalu || len == 0) {
+            return;
+        }
+        if (frame_buffer_.size() + len + 4 > kMaxAssembledFrameBytes) {
+            clearCurrentFrameState();
             return;
         }
         static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
@@ -533,6 +541,9 @@ private:
                     }
                 }
                 if (len > 2) {
+                    if (frame_buffer_.size() + (len - 2) > kMaxAssembledFrameBytes) {
+                        clearCurrentFrameState(); return;   // FU 分片累积超限 → 丢弃在建帧
+                    }
                     frame_buffer_.insert(frame_buffer_.end(), data + 2, data + len);
                 }
             }
@@ -585,6 +596,9 @@ private:
                     return;
                 }
                 if (len > 3 && !h265_fu_drop_mode_) {
+                    if (frame_buffer_.size() + (len - 3) > kMaxAssembledFrameBytes) {
+                        h265_fu_drop_mode_ = true; clearCurrentFrameState(); return;  // 累积超限 → 丢弃
+                    }
                     frame_buffer_.insert(frame_buffer_.end(), data + 3, data + len);
                 }
                 if (end && h265_fu_in_progress_) {
@@ -958,9 +972,14 @@ struct ClientSession {
                 if (!use_tcp_interleaved && rtp_sender && (packet_count % 100 == 0)) {
                     auto now = std::chrono::system_clock::now();
                     auto epoch = now.time_since_epoch();
-                    uint64_t ntp_ts = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
-                    ntp_ts = (ntp_ts + 2208988800u) << 32;  // NTP epoch offset
-                    
+                    const uint64_t secs  = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
+                    const uint64_t nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(epoch).count()
+                                           % 1000000000ull;
+                    // NTP 64bit：高 32 位秒（含 1900 epoch 偏移），低 32 位小数（纳秒 → 2^32 单位）。
+                    // 此前小数位恒为 0，导致严格客户端的 NTP↔RTP 映射只有 1s 分辨率、A/V 同步误差大。
+                    const uint64_t frac = (nanos << 32) / 1000000000ull;
+                    uint64_t ntp_ts = ((secs + 2208988800ull) << 32) | (frac & 0xFFFFFFFFull);
+
                     uint32_t rtp_ts = convertToRtpTimestamp(frame.pts, 90000);
                     rtp_sender->sendSenderReport(rtp_ts, ntp_ts, packet_count.load(), octet_count.load());
                 }

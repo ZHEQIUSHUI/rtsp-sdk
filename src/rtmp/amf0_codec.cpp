@@ -182,8 +182,9 @@ size_t readShortString(const uint8_t* data, size_t len, std::string* out) {
 
 }  // namespace
 
-size_t parseValue(const uint8_t* data, size_t len, Value* out) {
+size_t parseValue(const uint8_t* data, size_t len, Value* out, int depth) {
     if (len < 1 || !out) return 0;
+    if (depth > 32) return 0;   // 嵌套过深 → 拒绝，防不可信服务器 payload 撑爆栈
     const uint8_t marker = data[0];
     size_t off = 1;
     switch (marker) {
@@ -239,7 +240,7 @@ size_t parseValue(const uint8_t* data, size_t len, Value* out) {
                 if (sn == 0) return 0;
                 off += sn;
                 auto v = std::make_shared<Value>();
-                const size_t vn = parseValue(data + off, len - off, v.get());
+                const size_t vn = parseValue(data + off, len - off, v.get(), depth + 1);
                 if (vn == 0) return 0;
                 off += vn;
                 out->obj_props.emplace_back(std::move(key), std::move(v));
@@ -252,7 +253,7 @@ size_t parseValue(const uint8_t* data, size_t len, Value* out) {
             out->type = Type::StrictArray;
             for (uint32_t i = 0; i < count; ++i) {
                 auto v = std::make_shared<Value>();
-                const size_t vn = parseValue(data + off, len - off, v.get());
+                const size_t vn = parseValue(data + off, len - off, v.get(), depth + 1);
                 if (vn == 0) return 0;
                 off += vn;
                 out->array.push_back(std::move(v));

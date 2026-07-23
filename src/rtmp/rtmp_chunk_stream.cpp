@@ -132,9 +132,18 @@ void ChunkStreamDecoder::setInChunkSize(uint32_t size) {
     in_chunk_size_ = size;
 }
 
+// 解析来自外部 RTMP 服务器/CDN（不可信）的响应时的资源上限，防内存耗尽 DoS：
+//   - 单条 RTMP 消息上限（msg_len 是 24bit 字段，最大 16MB，无上限则每 csid 可钉 16MB）
+//   - 未消费缓冲上限（对端发不完整 chunk 头并停顿时 buffer_ 会无限增长）
+//   - 并发 chunk stream (csid) 数量上限（每个 csid 一个 partial 累积缓冲）
+static constexpr size_t kMaxRtmpMessageBytes = 8 * 1024 * 1024;
+static constexpr size_t kMaxRtmpBufferBytes  = kMaxRtmpMessageBytes + 64 * 1024;
+static constexpr size_t kMaxRtmpCsids        = 64;
+
 bool ChunkStreamDecoder::feed(const uint8_t* data, size_t len, std::vector<RtmpMessage>* out) {
     if (!out) return false;
     bytes_in_ += len;
+    if (buffer_.size() + len > kMaxRtmpBufferBytes) return false;  // 未消费缓冲超限 → 协议错误
     buffer_.insert(buffer_.end(), data, data + len);
 
     while (true) {
@@ -167,6 +176,10 @@ int ChunkStreamDecoder::parseOneChunk(const uint8_t* data, size_t len,
         off += 1;
     }
 
+    // 限制并发 csid 数：新 csid 且已达上限 → 协议错误，避免 map 无限增长
+    if (cs_states_.find(csid) == cs_states_.end() && cs_states_.size() >= kMaxRtmpCsids) {
+        return -1;
+    }
     CsState& st = cs_states_[csid];
 
     // Message Header 尺寸与字段
@@ -234,6 +247,9 @@ int ChunkStreamDecoder::parseOneChunk(const uint8_t* data, size_t len,
             new_abs_ts = st.timestamp + st.timestamp_delta;
         }
     }
+    // 单条消息长度上限：msg_len 完全由对端控制（24bit，≤16MB），无上限则每 csid 可钉住内存
+    if (msg_len > kMaxRtmpMessageBytes) return -1;
+
     st.msg_length    = msg_len;
     st.msg_type_id   = type_id;
     st.msg_stream_id = stream_id;
