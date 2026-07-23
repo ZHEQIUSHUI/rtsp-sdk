@@ -77,6 +77,12 @@ target_link_libraries(rtsp_test_rtmp_flv PRIVATE rtsp-sdk)
 add_test(NAME test_rtmp_flv COMMAND rtsp_test_rtmp_flv)
 set_tests_properties(test_rtmp_flv PROPERTIES TIMEOUT 10)
 
+# DoS 加固回归：AMF0 嵌套深度 / RTMP 单消息长度 / 并发 csid 上限（纯函数）
+add_executable(rtsp_test_dos_hardening test_dos_hardening.cpp)
+target_link_libraries(rtsp_test_dos_hardening PRIVATE rtsp-sdk)
+add_test(NAME test_dos_hardening COMMAND rtsp_test_dos_hardening)
+set_tests_properties(test_dos_hardening PROPERTIES TIMEOUT 10)
+
 # 端到端：mock RTMP server + 完整 publish 流程
 add_executable(rtsp_test_rtmp_publisher test_rtmp_publisher.cpp)
 target_link_libraries(rtsp_test_rtmp_publisher PRIVATE rtsp-sdk)
