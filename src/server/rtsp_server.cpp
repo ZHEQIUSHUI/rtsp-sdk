@@ -136,6 +136,18 @@ VideoFrame cloneFrameManaged(const VideoFrame& src) {
     return copy;
 }
 
+// 若帧已托管（managed_data 拥有底层 buffer 且 data 指向它），直接共享 shared_ptr
+// 而非深拷字节：帧在打包时只读，多会话并发只读同一 buffer 安全，shared_ptr 引用计数
+// 保证最后一个消费者用完才释放。避免 broadcastFrame 对每个拉流会话各深拷一次。
+// 未托管（裸指针）则回退深拷以获得所有权。
+VideoFrame shareFrameManaged(const VideoFrame& src) {
+    if (src.managed_data && !src.managed_data->empty() &&
+        src.data == src.managed_data->data() && src.size == src.managed_data->size()) {
+        return src;  // 拷 struct（含 shared_ptr，引用计数+1），不拷字节
+    }
+    return cloneFrameManaged(src);
+}
+
 bool joinThreadWithTimeout(std::thread& t, uint32_t timeout_ms) {
     if (!t.joinable()) return true;
     std::thread owned = std::move(t);
@@ -891,9 +903,9 @@ struct ClientSession {
             frame_queue.pop();
         }
         
-        // 复制帧
-        VideoFrame copy = cloneFrameManaged(frame);
-        
+        // 已托管帧共享底层 buffer（不再逐会话深拷）；未托管则深拷以获得所有权
+        VideoFrame copy = shareFrameManaged(frame);
+
         frame_queue.push(copy);
         queue_cv.notify_one();
         return true;
@@ -1014,20 +1026,22 @@ struct MediaPath {
     }
     
     void broadcastFrame(const VideoFrame& frame) {
-        // 更新最新帧
+        // 只克隆一次到 managed 帧；latest_frame 缓存与所有拉流会话共享同一底层 buffer
+        // （只读），把每会话一次深拷降为每帧一次。
+        VideoFrame managed = cloneFrameManaged(frame);
         {
             std::lock_guard<std::mutex> lock(latest_frame_mutex);
             freeVideoFrame(latest_frame);
-            latest_frame = cloneFrameManaged(frame);
+            latest_frame = managed;   // 共享 shared_ptr
             has_latest_frame = true;
         }
-        
-        // 广播到所有客户端
+
+        // 广播到所有客户端（pushFrame 内部对已托管帧共享而非再克隆）
         std::lock_guard<std::mutex> lock(sessions_mutex);
         for (auto& session_pair : sessions) {
             auto& session = session_pair.second;
             if (session->playing) {
-                session->pushFrame(frame);
+                session->pushFrame(managed);
             }
         }
     }
