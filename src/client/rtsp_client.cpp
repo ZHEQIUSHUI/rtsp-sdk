@@ -949,7 +949,10 @@ public:
             if (!body.empty()) req << body;
 
             std::string req_str = req.str();
-            if (control_socket_->send((const uint8_t*)req_str.c_str(), req_str.size()) <= 0) {
+            // 带写超时的全量发送：坏 peer 不读时，裸阻塞 send 会让 close()/teardown()
+            // 卡死超过契约超时。sendAll 在 recv_timeout_ms 内尽量发完，超时/错误返回非全长。
+            if (control_socket_->sendAll((const uint8_t*)req_str.c_str(), req_str.size(),
+                                         recv_timeout_ms) != static_cast<ssize_t>(req_str.size())) {
                 return false;
             }
             return recvRtspResponse(control_socket_.get(), &response, recv_timeout_ms);

@@ -261,15 +261,25 @@ public:
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     deadline - std::chrono::steady_clock::now()).count());
             const int poll_to = std::min(200, std::max(1, remain));
-            ssize_t n = socket_->recv(buf, sizeof(buf), poll_to);
+            // 先等可读，区分超时与硬错误：waitReadable 返回 0=超时（继续到 deadline）、
+            // -1=POLLERR/POLLHUP（对端断，立即退出）。旧代码把 n<0 静默继续——Linux 上
+            // RST 后 recv 先 -1 再 0，靠下一次 n==0 退出还算快，但那是平台特定行为；在
+            // 不保证该行为的系统上会忙等。显式判 POLLERR/POLLHUP 更稳、少一次无谓迭代。
+            const int wr = socket_->waitReadable(poll_to);
+            if (wr < 0) {
+                setErr("socket error/hup while waiting for command result");
+                return false;
+            }
+            if (wr == 0) continue;   // 超时，回到循环顶检查 deadline
+            ssize_t n = socket_->recv(buf, sizeof(buf), 0);
             if (n > 0) {
                 if (!dec_.feed(buf, static_cast<size_t>(n), &msgs)) {
                     setErr("chunk decode error");
                     return false;
                 }
-            } else if (n == 0) {
+            } else {
                 setErr("peer closed during wait for command result");
-                return false;
+                return false;   // n==0 关闭；n<0 真错误
             }
             // 扫描已到消息
             for (auto it = msgs.begin(); it != msgs.end(); ) {

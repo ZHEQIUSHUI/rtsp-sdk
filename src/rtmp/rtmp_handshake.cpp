@@ -22,13 +22,20 @@ bool recvExact(Socket& s, uint8_t* out, size_t n, int deadline_ms) {
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
         if (remain < 1) remain = 1;
         const int poll_to = remain < 200 ? remain : 200;
-        ssize_t r = s.recv(out + off, n - off, poll_to);
+        // 先等可读，把「超时」与「硬错误」分开：waitReadable 返回 0=超时（继续到
+        // deadline）、-1=POLLERR/POLLHUP/POLLNVAL（对端断，立即退出）。旧写法把 recv<0
+        // 一律当超时重试——Linux 上 RST 后 recv 先 -1 再 0，靠 r==0 退出还算快；但那是
+        // 平台特定行为，在不保证「ECONNRESET 后 recv 返回 0」的系统上会 poll 立即可读+
+        // recv 持续 -1 而忙等。显式判 POLLERR/POLLHUP 更稳、也少一次无谓迭代。
+        const int wr = s.waitReadable(poll_to);
+        if (wr < 0) return false;   // 硬错误/对端挂断，立即退出
+        if (wr == 0) continue;      // 超时，回到循环顶重新算 deadline
+        const ssize_t r = s.recv(out + off, n - off, 0);
         if (r > 0) {
             off += static_cast<size_t>(r);
-        } else if (r == 0) {
-            return false;   // peer closed
+        } else {
+            return false;   // r==0 对端关闭；r<0 真错误。均立即失败
         }
-        // r<0 是超时/瞬时错误，继续直到 deadline
     }
     return true;
 }

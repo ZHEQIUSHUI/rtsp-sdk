@@ -92,6 +92,15 @@ endif()
 add_test(NAME test_rtmp_publisher COMMAND rtsp_test_rtmp_publisher)
 set_tests_properties(test_rtmp_publisher PROPERTIES TIMEOUT 30)
 
+# 坏 peer 快速失败回归（RTMP-SPIN）：accept 即断 / 握手后断，open 必须快速失败不忙等
+add_executable(rtsp_test_rtmp_bad_peer test_rtmp_bad_peer.cpp)
+target_link_libraries(rtsp_test_rtmp_bad_peer PRIVATE rtsp-sdk)
+if(WIN32)
+    target_link_libraries(rtsp_test_rtmp_bad_peer PRIVATE ws2_32)
+endif()
+add_test(NAME test_rtmp_bad_peer COMMAND rtsp_test_rtmp_bad_peer)
+set_tests_properties(test_rtmp_bad_peer PROPERTIES TIMEOUT 30)
+
 # ONVIF 相关测试
 # WS-Discovery Probe 往返（可能在不支持多播的 CI 容器中跳过）
 add_executable(rtsp_test_onvif_discovery test_onvif_discovery.cpp)
