@@ -298,6 +298,62 @@ jobs:
           echo "pull exit=$PULL_EC"
           test "$PULL_EC" = 0 || exit 1
           ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 /tmp/out.mp4 | grep -q h264
+      # 多消费者回归：一个 self-host server + N 个并发 rtsp-cli 拉流，每个都必须收到帧。
+      # 专门守护"并发客户端 RTP 端口撞车"回归——修复前同机多个客户端都绑 20000，
+      # SO_REUSEADDR 让服务端把流全发到一个口，只有一个客户端能收到帧（1/N）。
+      # 另起一个 ffmpeg 消费者做独立交叉验证（隔离 server-vs-client 问题）。
+      # 稳定要点：动态空闲端口（不硬编码）、就绪轮询 + 显式 listen 断言、按 PID 数组
+      # 精确 kill、只 wait 有界的消费者（不 wait 无限 push）、逐个消费者断言帧数正确。
+      - name: Multi-consumer (concurrent pulls must each receive frames)
+        run: |
+          set +e
+          BIN=build/apps/rtsp-cli/rtsp-cli
+          FIX=apps/rtsp-cli/testdata/sample.h264
+          N=3
+          # 动态拿一个空闲端口，避免硬编码撞车
+          PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+          echo "server port=$PORT, consumers=$N"
+          "$BIN" push -i "$FIX" -o rtsp://127.0.0.1:$PORT/live -r -1 > /tmp/mcpush.log 2>&1 &
+          PUSH=$!
+          trap 'kill $PUSH 2>/dev/null; pkill -x rtsp-cli 2>/dev/null' EXIT
+          # 就绪轮询 + 显式断言 server 真的起来了
+          for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
+          ss -ltn 2>/dev/null | grep -q ":$PORT " || { echo "server failed to bind $PORT"; cat /tmp/mcpush.log; exit 1; }
+          # N 个并发 rtsp-cli 消费者，各存各的 mp4，记录 PID
+          PIDS=()
+          for i in $(seq 1 $N); do
+            "$BIN" pull -i rtsp://127.0.0.1:$PORT/live -o /tmp/mc$i.mp4 -t 4 --quiet > /tmp/mc$i.log 2>&1 &
+            PIDS+=($!)
+          done
+          # 独立交叉验证：一个 ffmpeg 消费者（UDP）
+          timeout 12 ffmpeg -rtsp_transport udp -i rtsp://127.0.0.1:$PORT/live \
+            -t 4 -c copy -f null - -hide_banner -loglevel warning > /tmp/mcff.log 2>&1 &
+          FF=$!
+          wait "${PIDS[@]}"        # 只等有界的消费者，不等无限 push
+          wait $FF 2>/dev/null
+          kill $PUSH 2>/dev/null; pkill -x rtsp-cli 2>/dev/null
+          # 逐个消费者断言：mp4 是 h264 且拿到足够帧数（并发全部成功 = N/N）
+          frames_in_mp4() {
+            ffprobe -v error -select_streams v:0 -count_packets \
+              -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null
+          }
+          fail=0
+          for i in $(seq 1 $N); do
+            cn=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 /tmp/mc$i.mp4 2>/dev/null)
+            fr=$(frames_in_mp4 /tmp/mc$i.mp4); fr=${fr:-0}
+            echo "consumer $i: codec=$cn frames=$fr"
+            [ "$cn" = h264 ] || { echo "  !! consumer $i: wrong/no codec"; fail=1; }
+            [ "$fr" -ge 10 ] 2>/dev/null || { echo "  !! consumer $i: too few frames ($fr) — port-collision regression?"; fail=1; }
+          done
+          echo "=== ffmpeg cross-check consumer ==="; cat /tmp/mcff.log
+          grep -q "Invalid data found when processing input" /tmp/mcff.log && { echo "  !! ffmpeg consumer saw invalid data"; fail=1; }
+          if [ "$fail" != 0 ]; then
+            echo "--- push log ---"; cat /tmp/mcpush.log
+            for i in $(seq 1 $N); do echo "--- consumer $i log ---"; cat /tmp/mc$i.log; done
+            exit 1
+          fi
+          echo "all $N concurrent consumers received frames"
+
       # RTMP leg：push -r -1 推到真实 mediamtx，必须出现 "is publishing" 且 ffprobe 读出 h264。
       # -r -1 跨循环边界，专门回归"循环时间戳必须单调"——倒退会让 RTMP 服务器拒绝建流。
       # docker 网络偶发吞包，整段 3 次重试。
