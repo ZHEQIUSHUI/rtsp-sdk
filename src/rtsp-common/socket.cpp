@@ -556,6 +556,11 @@ uint16_t Socket::getPeerPort() const {
 // ----------------------------------------------------------------
 // 公共工具：读完整 RTSP 消息
 // ----------------------------------------------------------------
+// 接收不可信 RTSP 响应/请求时的上限：恶意对端可发超大 Content-Length 或永不终止的
+// header 撑爆内存（服务端连接循环已有类似上限，此处补齐 client/publisher 收流路径）。
+static constexpr std::size_t kMaxRtspHeaderBytes = 64 * 1024;
+static constexpr std::size_t kMaxRtspBodyBytes   = 2 * 1024 * 1024;
+
 bool recvRtspMessage(Socket& socket, std::string* out, int timeout_ms) {
     if (out == nullptr) return false;
     out->clear();
@@ -607,10 +612,13 @@ bool recvRtspMessage(Socket& socket, std::string* out, int timeout_ms) {
                     const std::size_t header_size = header_end + 4;
                     std::size_t cl = 0;
                     if (parseContentLength(out->substr(0, header_size), &cl)) {
+                        if (cl > kMaxRtspBodyBytes) return false;   // body 超限 → 拒绝
                         expected_total = header_size + cl;
                     } else {
                         expected_total = header_size;
                     }
+                } else if (out->size() > kMaxRtspHeaderBytes) {
+                    return false;   // header 超限仍无 \r\n\r\n 终止 → 拒绝
                 }
             }
             if (expected_total != 0 && out->size() >= expected_total) {

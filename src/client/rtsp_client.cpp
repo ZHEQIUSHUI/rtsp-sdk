@@ -87,6 +87,10 @@ bool parseContentLength(const std::string& headers, std::size_t* out) {
     }
 }
 
+// 恶意/畸形 RTSP 服务器可发超大 Content-Length 或永不终止的 header 撑爆内存；加上限。
+static constexpr std::size_t kMaxRtspRespHeaderBytes = 64 * 1024;
+static constexpr std::size_t kMaxRtspRespBodyBytes   = 2 * 1024 * 1024;
+
 bool recvRtspResponse(Socket* socket, std::string* response, int timeout_ms) {
     if (socket == nullptr || response == nullptr) {
         return false;
@@ -115,10 +119,13 @@ bool recvRtspResponse(Socket* socket, std::string* response, int timeout_ms) {
                     const std::size_t header_size = header_end_pos + 4;
                     std::size_t content_length = 0;
                     if (parseContentLength(response->substr(0, header_size), &content_length)) {
+                        if (content_length > kMaxRtspRespBodyBytes) return false;   // body 超限
                         expected_total_size = header_size + content_length;
                     } else {
                         expected_total_size = header_size;
                     }
+                } else if (response->size() > kMaxRtspRespHeaderBytes) {
+                    return false;   // header 超限仍无终止 → 拒绝
                 }
             }
 
@@ -297,8 +304,16 @@ public:
     uint16_t getRtcpPort() const { return rtcp_port_; }
 
 private:
+    // 单帧组装上限：不可信服务器若始终不置 RTP marker/不变时间戳，frame_buffer_ 会
+    // 无限增长 → 内存耗尽。超限即丢弃在建帧。
+    static constexpr size_t kMaxAssembledFrameBytes = 8 * 1024 * 1024;
+
     void appendAnnexBNalu(const uint8_t* nalu, size_t len) {
         if (!nalu || len == 0) return;
+        if (frame_buffer_.size() + len + 4 > kMaxAssembledFrameBytes) {
+            clearCurrentFrameState();
+            return;
+        }
         static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
         frame_buffer_.insert(frame_buffer_.end(), start_code, start_code + 4);
         frame_buffer_.insert(frame_buffer_.end(), nalu, nalu + len);
@@ -481,6 +496,9 @@ private:
                     if ((reconstructed_nal & 0x1F) == 5) frame_is_idr_ = true;
                 }
                 if (len > 2) {
+                    if (frame_buffer_.size() + (len - 2) > kMaxAssembledFrameBytes) {
+                        clearCurrentFrameState(); return;   // FU 分片累积超限 → 丢弃
+                    }
                     frame_buffer_.insert(frame_buffer_.end(), data + 2, data + len);
                 }
             }
@@ -527,6 +545,9 @@ private:
                     return;
                 }
                 if (len > 3 && !h265_fu_drop_mode_) {
+                    if (frame_buffer_.size() + (len - 3) > kMaxAssembledFrameBytes) {
+                        h265_fu_drop_mode_ = true; clearCurrentFrameState(); return;  // 累积超限 → 丢弃
+                    }
                     frame_buffer_.insert(frame_buffer_.end(), data + 3, data + len);
                 }
                 if (end && h265_fu_in_progress_) {
