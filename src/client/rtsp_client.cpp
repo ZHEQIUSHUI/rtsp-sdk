@@ -162,10 +162,12 @@ public:
     ~RtpReceiver() { stop(); }
 
     bool init(uint16_t rtp_port, uint16_t rtcp_port) {
-        if (!rtp_socket_.bindUdp("0.0.0.0", rtp_port)) {
+        // reuse_addr=false：同机多个客户端并发时，避免因 SO_REUSEADDR 抢占同一 RTP 端口
+        // 而互相丢包；绑定失败会让上层 SETUP 循环换下一个端口。
+        if (!rtp_socket_.bindUdp("0.0.0.0", rtp_port, /*reuse_addr=*/false)) {
             return false;
         }
-        if (!rtcp_socket_.bindUdp("0.0.0.0", rtcp_port)) {
+        if (!rtcp_socket_.bindUdp("0.0.0.0", rtcp_port, /*reuse_addr=*/false)) {
             return false;
         }
         rtp_socket_.setNonBlocking(true);

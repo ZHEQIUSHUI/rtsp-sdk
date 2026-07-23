@@ -294,12 +294,12 @@ bool Socket::connect(const std::string& ip, uint16_t port, int timeout_ms) {
     return true;
 }
 
-bool Socket::bindUdp(const std::string& ip, uint16_t port) {
+bool Socket::bindUdp(const std::string& ip, uint16_t port, bool reuse_addr) {
     int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0) return false;
 
     impl_->fd_ = fd;
-    if (!setReuseAddr(true)) {
+    if (reuse_addr && !setReuseAddr(true)) {
         impl_->close();
         return false;
     }

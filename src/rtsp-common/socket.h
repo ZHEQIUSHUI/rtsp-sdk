@@ -32,8 +32,9 @@ public:
     std::unique_ptr<Socket> accept();
     bool connect(const std::string& ip, uint16_t port, int timeout_ms = 5000);
     
-    // UDP
-    bool bindUdp(const std::string& ip, uint16_t port);
+    // UDP。reuse_addr=false 时不设 SO_REUSEADDR：用于 RTP 接收口，避免同机多个客户端
+    // 因 SO_REUSEADDR 绑到同一端口而互相抢包（Linux 下 UDP+REUSEADDR 允许同端口双绑）。
+    bool bindUdp(const std::string& ip, uint16_t port, bool reuse_addr = true);
     ssize_t sendTo(const uint8_t* data, size_t size, const std::string& ip, uint16_t port);
     ssize_t recvFrom(uint8_t* buffer, size_t size, std::string& from_ip, uint16_t& from_port);
 
