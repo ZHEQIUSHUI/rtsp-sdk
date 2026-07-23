@@ -197,7 +197,7 @@ int run_push(const PushOpts& o) {
     uint64_t total_frames = 0, total_bytes = 0, win_frames = 0, win_bytes = 0;
     uint64_t prev_srv_bytes = 0, prev_rtmp_bytes = 0;
     int done_loops = 0;
-    bool wrote_status = false, stop = false;
+    bool wrote_status = false, stop = false, had_error = false;
     const double frame_ms = 1000.0 / fps;
 
     while (!stop && !g_interrupted.load()) {
@@ -218,7 +218,7 @@ int run_push(const PushOpts& o) {
             if (sink.push(au)) { ++total_frames; total_bytes += au.data.size(); ++win_frames; win_bytes += au.data.size(); }
             else if (sink.rtmp && !sink.rtmp->isConnected()) {
                 std::fprintf(stderr, "\n错误: RTMP 连接断开: %s\n", sink.rtmp->getLastError().c_str());
-                stop = true; break;
+                stop = true; had_error = true; break;
             }
 
             if (!o.quiet) {
@@ -265,6 +265,10 @@ int run_push(const PushOpts& o) {
         "=== Summary ===\n  Duration:   %.1f s\n  Loops:      %d\n  Frames:     %llu pushed\n  Avg bitrate:%.0f kbps\n",
         total_sec, done_loops, (unsigned long long)total_frames,
         total_sec > 0 ? (total_bytes * 8.0 / total_sec / 1000.0) : 0.0);
+    // 用户 Ctrl-C 停止视为正常退出；否则连接中途出错或一帧都没推出去，返回非零。
+    if (g_interrupted.load()) return 0;
+    if (had_error) return 1;
+    if (total_frames == 0) { std::fprintf(stderr, "错误: 未推出任何帧\n"); return 1; }
     return 0;
 }
 

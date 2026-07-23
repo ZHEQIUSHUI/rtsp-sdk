@@ -298,7 +298,9 @@ public:
         w->codec_ = codec; w->vps_ = vps; w->sps_ = sps; w->pps_ = pps;
         if (mp4_h26x_write_init(&w->h_, mux, width > 0 ? width : 1920, height > 0 ? height : 1080,
                                 codec == CodecType::H265 ? 1 : 0) != MP4E_STATUS_OK) {
-            MP4E_close(mux); std::fclose(f); delete w; err = "mp4_h26x_write_init 失败"; return nullptr;
+            // 不在此手动 MP4E_close/fclose：w->mux_/w->f_ 已赋值，delete w 的析构会
+            // 一次性清理（inited_=false 故跳过 write_close）。手动再关会造成 double-free。
+            delete w; err = "mp4_h26x_write_init 失败"; return nullptr;
         }
         w->inited_ = true;
         return w;
