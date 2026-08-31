@@ -4,6 +4,7 @@
 #include <rtsp-common/rtp_packer.h>
 #include <rtsp-common/common.h>
 
+#include <chrono>
 #include <regex>
 #include <sstream>
 #include <random>
@@ -86,6 +87,43 @@ public:
     bool announced_ = false;
     bool setup_done_ = false;
     bool recording_ = false;
+    std::chrono::steady_clock::time_point last_keepalive_{};
+
+    // RTP 走 UDP，服务器消失后 sendTo 依旧“成功”——断链只能靠 RTSP control TCP 感知：
+    // 对端 FIN → recv 返回 0；对端 RST（进程被 kill）→ 后续 send 失败。
+    // 这里非阻塞清掉积压的 keepalive 响应，再发一条 GET_PARAMETER（不等回包）。
+    bool checkControlAlive() {
+        if (!control_socket_) return false;
+        uint8_t buf[2048];
+        for (;;) {
+            const ssize_t n = control_socket_->recv(buf, sizeof(buf), 0);
+            if (n == 0) return false;   // 对端已关闭
+            if (n < 0) break;           // 暂无数据（EAGAIN）
+        }
+        std::ostringstream req;
+        req << "GET_PARAMETER " << request_url_ << " RTSP/1.0\r\nCSeq: " << ++cseq_ << "\r\n";
+        if (!session_id_.empty()) req << "Session: " << session_id_ << "\r\n";
+        req << "User-Agent: " << config_.user_agent << "\r\n\r\n";
+        const std::string wire = req.str();
+        return control_socket_->sendAll(reinterpret_cast<const uint8_t*>(wire.data()),
+                                        wire.size(), 1000) == static_cast<ssize_t>(wire.size());
+    }
+
+    // 断链后把状态打回未连接，让上层能走完整的 open→announce→setup→record 重连
+    void markDisconnected() {
+        recording_ = false;
+        setup_done_ = false;
+        announced_ = false;
+        session_id_.clear();
+        rtp_packer_.reset();
+        rtp_sender_.reset();
+        if (control_socket_) {
+            control_socket_->shutdownReadWrite();
+            control_socket_->close();
+            control_socket_.reset();
+        }
+        connected_ = false;
+    }
 
     // Digest 鉴权状态
     std::string auth_user_;
@@ -368,11 +406,23 @@ bool RtspPublisher::record() {
     if (!impl_->sendRequestWithAuth("RECORD", impl_->request_url_, "", "", resp, status)) return false;
     if (status != 200) return false;
     impl_->recording_ = true;
+    impl_->last_keepalive_ = std::chrono::steady_clock::now();
     return true;
 }
 
 bool RtspPublisher::pushFrame(const VideoFrame& frame) {
     if (!impl_->recording_ || !impl_->rtp_packer_ || !impl_->rtp_sender_) return false;
+
+    // 周期探活控制连接：这是感知“推流服务器被重启/关闭”的唯一手段（见 checkControlAlive）
+    const auto now = std::chrono::steady_clock::now();
+    if (now - impl_->last_keepalive_ >= std::chrono::seconds(5)) {
+        impl_->last_keepalive_ = now;
+        if (!impl_->checkControlAlive()) {
+            impl_->markDisconnected();
+            return false;
+        }
+    }
+
     auto packets = impl_->rtp_packer_->packFrame(frame);
     for (auto& p : packets) {
         impl_->rtp_sender_->sendRtpPacket(p);

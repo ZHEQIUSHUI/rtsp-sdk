@@ -512,18 +512,23 @@ bool RtpSender::init(const std::string& local_ip, uint16_t local_port) {
     if (!impl_) {
         return false;
     }
-    // RTP socket
-    if (!impl_->rtp_socket_.bindUdp(local_ip, local_port)) {
-        return false;
-    }
-    
-    // RTCP socket (RTP端口 + 1)
-    if (!impl_->rtcp_socket_.bindUdp(local_ip, local_port + 1)) {
+    // local_port==0 表示随机端口：必须先绑 RTP 拿到实际端口，再绑相邻 RTCP 端口。
+    // 不能直接用 local_port+1 —— 0+1 是特权端口 1，非 root 进程 bind 必然失败。
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        if (!impl_->rtp_socket_.bindUdp(local_ip, local_port)) {
+            if (local_port != 0) return false;
+            continue;
+        }
+        const uint16_t rtp_port = impl_->rtp_socket_.getLocalPort();
+        if (rtp_port != 0 && rtp_port < 65535 &&
+            impl_->rtcp_socket_.bindUdp(local_ip, static_cast<uint16_t>(rtp_port + 1))) {
+            return true;
+        }
+        // 相邻端口被占（或拿不到端口号）：换一个随机 RTP 端口重试
         impl_->rtp_socket_.close();
-        return false;
+        if (local_port != 0) return false;
     }
-    
-    return true;
+    return false;
 }
 
 bool RtpSender::setPeer(const std::string& peer_ip, uint16_t peer_rtp_port, uint16_t peer_rtcp_port) {
